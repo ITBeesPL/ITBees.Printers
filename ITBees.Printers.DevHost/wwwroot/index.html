@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ITBees.Printers sandbox</title>
+  <style>
+    :root { color-scheme: light dark; --line: #8884; --accent: #2563eb; --ok: #16a34a; --bad: #dc2626; }
+    body { font: 15px/1.45 system-ui, sans-serif; margin: 0 auto; padding: 24px 16px 64px; max-width: 920px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 28px 0 8px; }
+    p.lead { margin: 0 0 16px; opacity: .75; }
+    section, .card { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 10px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .65; }
+    button { font: inherit; padding: 6px 12px; border-radius: 7px; border: 1px solid var(--line); cursor: pointer; background: transparent; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .5; cursor: default; }
+    select, input[type=number] { font: inherit; padding: 5px 6px; border-radius: 7px; border: 1px solid var(--line); background: transparent; max-width: 100%; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--bad); }
+    .dot.on { background: var(--ok); }
+    .muted { opacity: .65; font-size: 13px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    #log { white-space: pre-wrap; font: 12.5px/1.5 ui-monospace, Consolas, monospace; max-height: 220px; overflow: auto; margin: 0; }
+    .connect { max-width: 520px; margin: 12vh auto 0; text-align: center; }
+    .connect .machine { font-size: 19px; font-weight: 600; margin: 10px 0 18px; }
+    .error { color: var(--bad); }
+    code { font-size: 13px; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+// Reference implementation of what a host frontend has to do. Two parts:
+//  1. the connect page (/print-agent/connect?port=&state=&machine=) the print agent opens in the browser,
+//  2. a "print" button: GET /PrintSettings?documentType= decides between POST /PrintJob and the PDF itself.
+const app = document.getElementById('app');
+const PrintMode = { DownloadPdf: 0, InstantPrint: 1, UseDefault: 2 };
+const JobStatus = ['Created', 'SentToAgent', 'Printed', 'Failed', 'AgentOffline', 'Rejected'];
+
+async function api(method, url, body) {
+  const response = await fetch(url, {
+    method,
+    headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) throw new Error(data?.message ?? `${response.status} ${response.statusText}`);
+  return data;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ---------------------------------------------------------------- connect page
+function renderConnectPage() {
+  const query = new URLSearchParams(location.search);
+  const port = Number(query.get('port'));
+  const state = query.get('state') ?? '';
+  const machine = query.get('machine') ?? '';
+
+  // Only ever a loopback port - never an address. The code must not be sendable anywhere else.
+  const valid = Number.isInteger(port) && port >= 1024 && port <= 65535 && state.length > 0;
+
+  app.innerHTML = `
+    <div class="connect card">
+      <h1>Connect the print agent</h1>
+      ${valid ? `
+        <p>The ITBees print agent running on this computer asks to be connected to your account:</p>
+        <div class="machine">${escapeHtml(machine || 'this computer')}</div>
+        <p class="muted">It will report the printers of that computer and print the documents you send to them.
+          Only confirm if you have just started the agent yourself.</p>
+        <div class="row" style="justify-content:center">
+          <button class="primary" id="confirm">Connect</button>
+          <button id="cancel">Cancel</button>
+        </div>
+        <p class="error" id="error"></p>`
+      : '<p class="error">This link is incomplete. Start the connection again from the print agent.</p>'}
+    </div>`;
+  if (!valid) return;
+
+  const callback = (params) => {
+    location.href = `http://127.0.0.1:${port}/callback?` + new URLSearchParams({ state, ...params });
+  };
+  document.getElementById('cancel').onclick = () => callback({ error: 'cancelled' });
+  document.getElementById('confirm').onclick = async (event) => {
+    event.target.disabled = true;
+    try {
+      const registration = await api('POST', '/PrintAgentRegistration', { machineName: machine });
+      callback({ code: registration.code, hub: registration.hubUrl, service: registration.serviceName });
+    } catch (e) {
+      document.getElementById('error').textContent = e.message;
+      event.target.disabled = false;
+    }
+  };
+}
+
+// ---------------------------------------------------------------- dashboard
+let agents = [];
+let settings = [];
+
+function log(message) {
+  const el = document.getElementById('log');
+  el.textContent = `${new Date().toLocaleTimeString()}  ${message}\n` + el.textContent;
+}
+
+function allPrinters() {
+  return agents.flatMap((a) => a.printers.map((p) => ({ ...p, agentOnline: a.isOnline })));
+}
+
+function printerOptions(selectedGuid) {
+  return '<option value="">(choose a printer)</option>' + allPrinters().map((p) =>
+    `<option value="${p.guid}" ${p.guid === selectedGuid ? 'selected' : ''}>${escapeHtml(p.name)} @ ${escapeHtml(p.agentMachineName)}${p.isReady ? '' : ' (not ready)'}</option>`).join('');
+}
+
+function renderDashboard() {
+  app.innerHTML = `
+    <h1>ITBees.Printers sandbox</h1>
+    <p class="lead">One in-memory user, always logged in. Start the agent with
+      <code>ITBees.Printers.Agent.exe --site ${escapeHtml(location.origin)}</code></p>
+
+    <h2>Print agents <button id="reload" style="float:right">Reload</button></h2>
+    <div id="agents"></div>
+
+    <h2>My print settings</h2>
+    <section><table><thead><tr><th>Document type</th><th>Mode</th><th>Printer</th><th>Copies</th><th>Effective</th><th></th></tr></thead>
+      <tbody id="settings"></tbody></table></section>
+
+    <h2>Print a PDF</h2>
+    <section class="row">
+      <input type="file" id="file" accept="application/pdf">
+      <select id="docType"></select>
+      <button class="primary" id="print">Print</button>
+      <span class="muted">follows the settings above: instant print, or the PDF opens in a new tab</span>
+    </section>
+
+    <h2>Log</h2>
+    <section><pre id="log"></pre></section>`;
+
+  document.getElementById('reload').onclick = load;
+  document.getElementById('print').onclick = printSelectedFile;
+  load();
+}
+
+async function load() {
+  try {
+    [agents, settings] = await Promise.all([api('GET', '/PrintAgents'), api('GET', '/PrintSettings')]);
+  } catch (e) { log('Load failed: ' + e.message); return; }
+
+  document.getElementById('agents').innerHTML = agents.length === 0
+    ? '<section class="muted">No agent connected to this account yet.</section>'
+    : agents.map((a) => `
+      <section>
+        <div class="row">
+          <strong><span class="dot ${a.isOnline ? 'on' : ''}"></span>${escapeHtml(a.machineName)}</strong>
+          <span class="muted">agent ${escapeHtml(a.agentVersion ?? '?')} · ${escapeHtml(a.osVersion ?? '')}</span>
+          <span style="flex:1"></span>
+          <button data-refresh="${a.guid}" ${a.isOnline ? '' : 'disabled'}>Rescan printers</button>
+          <button data-remove="${a.guid}">Remove</button>
+        </div>
+        <table><thead><tr><th>Printer</th><th>Driver / port</th><th>State</th><th></th></tr></thead><tbody>
+          ${a.printers.map((p) => `<tr>
+            <td>${escapeHtml(p.name)}${p.isDefault ? ' <span class="muted">(default)</span>' : ''}</td>
+            <td class="muted">${escapeHtml(p.driverName ?? '')}<br>${escapeHtml(p.portName ?? '')}</td>
+            <td>${!p.isAvailable ? 'removed' : p.isOffline ? 'offline' : escapeHtml(p.status ?? 'ok')}</td>
+            <td><button data-test="${p.guid}" ${p.isReady ? '' : 'disabled'}>Test page</button></td></tr>`).join('')}
+        </tbody></table>
+      </section>`).join('');
+
+  document.getElementById('settings').innerHTML = settings.map((s) => `
+    <tr data-doc="${escapeHtml(s.documentType)}">
+      <td>${escapeHtml(s.documentTypeName)}<div class="muted"><code>${escapeHtml(s.documentType)}</code></div></td>
+      <td><select data-field="mode">
+        ${s.isDefault ? '' : `<option value="2" ${s.mode === 2 ? 'selected' : ''}>Like the default</option>`}
+        <option value="0" ${s.mode === 0 ? 'selected' : ''}>Download PDF</option>
+        <option value="1" ${s.mode === 1 ? 'selected' : ''}>Instant print</option></select></td>
+      <td><select data-field="printer">${printerOptions(s.printerGuid)}</select></td>
+      <td><input data-field="copies" type="number" min="1" max="99" value="${s.copies}" style="width:60px"></td>
+      <td class="muted">${s.effectiveMode === 1
+        ? `<span class="dot ${s.isPrinterReady ? 'on' : ''}"></span>${escapeHtml(s.effectivePrinterName ?? 'no printer')}`
+        : 'PDF'}</td>
+      <td><button data-save>Save</button></td>
+    </tr>`).join('');
+
+  document.getElementById('docType').innerHTML = settings.map((s) =>
+    `<option value="${escapeHtml(s.isDefault ? '' : s.documentType)}">${escapeHtml(s.documentTypeName)}</option>`).join('');
+
+  app.querySelectorAll('[data-refresh]').forEach((b) => b.onclick = async () => {
+    const result = await api('POST', '/PrintAgentPrintersRefresh?agentGuid=' + b.dataset.refresh);
+    log(result.requested ? 'Rescan requested.' : 'The agent is offline.');
+    setTimeout(load, 1500);
+  });
+  app.querySelectorAll('[data-remove]').forEach((b) => b.onclick = async () => {
+    if (!confirm('Remove this agent? Its token stops working.')) return;
+    await api('DELETE', '/PrintAgent?guid=' + b.dataset.remove);
+    log('Agent removed.');
+    load();
+  });
+  app.querySelectorAll('[data-test]').forEach((b) => b.onclick = async () => {
+    try { followJob(await api('POST', '/PrintTestPage', { printerGuid: b.dataset.test })); }
+    catch (e) { log('Test page failed: ' + e.message); }
+  });
+  app.querySelectorAll('[data-save]').forEach((b) => b.onclick = async () => {
+    const row = b.closest('tr');
+    try {
+      await api('PUT', '/PrintSetting', {
+        documentType: row.dataset.doc,
+        mode: Number(row.querySelector('[data-field=mode]').value),
+        printerGuid: row.querySelector('[data-field=printer]').value || null,
+        copies: Number(row.querySelector('[data-field=copies]').value),
+      });
+      log(`Setting "${row.dataset.doc}" saved.`);
+      load();
+    } catch (e) { log('Save failed: ' + e.message); }
+  });
+}
+
+// What a "print" button of a host frontend does with a PDF it has just fetched.
+async function printSelectedFile() {
+  const file = document.getElementById('file').files[0];
+  if (!file) { log('Choose a PDF first.'); return; }
+  const documentType = document.getElementById('docType').value;
+
+  const [setting] = await api('GET', '/PrintSettings?documentType=' + encodeURIComponent(documentType || '*'));
+  if (setting.effectiveMode !== PrintMode.InstantPrint || !setting.isPrinterReady) {
+    log(setting.effectiveMode === PrintMode.InstantPrint
+      ? 'Instant print is on, but the printer is not ready - opening the PDF instead.'
+      : 'This document type is set to "Download PDF" - opening the PDF.');
+    window.open(URL.createObjectURL(file), '_blank');
+    return;
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  try {
+    const job = await api('POST', '/PrintJob', { documentType, documentName: file.name, contentBase64: btoa(binary) });
+    if (job.shouldFallBackToPdf) window.open(URL.createObjectURL(file), '_blank');
+    followJob(job);
+  } catch (e) { log('Print failed: ' + e.message); }
+}
+
+async function followJob(job) {
+  log(`Job ${job.guid.slice(0, 8)} "${job.documentName}" -> ${job.printerName}: ${JobStatus[job.status]} ${job.statusMessage ?? ''}`);
+  for (let attempt = 0; !job.isFinished && attempt < 30; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    job = await api('GET', '/PrintJob?guid=' + job.guid);
+    if (job.isFinished) log(`Job ${job.guid.slice(0, 8)}: ${JobStatus[job.status]} ${job.statusMessage ?? ''} (${job.pagesPrinted ?? 0} pages)`);
+  }
+}
+
+if (location.pathname.replace(/\/+$/, '') === '/print-agent/connect') renderConnectPage();
+else renderDashboard();
+</script>
+</body>
+</html>

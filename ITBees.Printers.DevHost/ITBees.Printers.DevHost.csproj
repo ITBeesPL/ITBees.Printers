@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- Development sandbox of ITBees.Printers: a throwaway web API with an in-memory database
+       and a single, always-logged-in user. It exists to run the library and the Windows print
+       agent end to end without any real application, database or login. Never deployed. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="8.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ITBees.Printers\ITBees.Printers.csproj" />
+  </ItemGroup>
+
+</Project>

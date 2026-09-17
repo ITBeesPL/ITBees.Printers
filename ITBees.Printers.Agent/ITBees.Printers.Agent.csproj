@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Windows print agent: a tray application that pairs with a user account of an ITBees web
+       application through the browser, reports the printers of this computer and silently
+       prints the documents the application sends to them. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- The Windows 10 projection is needed for Windows.Data.Pdf (PDF rendering without any
+         third-party library). -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationVisualStyles>true</ApplicationVisualStyles>
+    <!-- Lets a non-Windows build server restore/build the solution. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <Version>1.0.0</Version>
+    <Product>ITBees Print Agent</Product>
+    <Company>ITBees</Company>
+    <AssemblyTitle>ITBees Print Agent</AssemblyTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The wire contract is shared with the server library as source, so the library stays a
+         single NuGet package. -->
+    <Compile Include="..\ITBees.Printers\Protocol\*.cs" Link="Protocol\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="8.0.10" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

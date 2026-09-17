@@ -5,6 +5,10 @@ VisualStudioVersion = 17.12.35527.113 d17.12
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITBees.Printers", "ITBees.Printers\ITBees.Printers.csproj", "{B2194FA3-4441-4925-BD6B-670630404D1D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITBees.Printers.DevHost", "ITBees.Printers.DevHost\ITBees.Printers.DevHost.csproj", "{7F0424CF-2D68-4BB2-9636-C0EEB62258AF}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITBees.Printers.Agent", "ITBees.Printers.Agent\ITBees.Printers.Agent.csproj", "{683C22AE-65F6-4353-9FE6-FDBC2DE299A9}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,6 +19,14 @@ Global
 		{B2194FA3-4441-4925-BD6B-670630404D1D}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{B2194FA3-4441-4925-BD6B-670630404D1D}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{B2194FA3-4441-4925-BD6B-670630404D1D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7F0424CF-2D68-4BB2-9636-C0EEB62258AF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7F0424CF-2D68-4BB2-9636-C0EEB62258AF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7F0424CF-2D68-4BB2-9636-C0EEB62258AF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7F0424CF-2D68-4BB2-9636-C0EEB62258AF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{683C22AE-65F6-4353-9FE6-FDBC2DE299A9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{683C22AE-65F6-4353-9FE6-FDBC2DE299A9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{683C22AE-65F6-4353-9FE6-FDBC2DE299A9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{683C22AE-65F6-4353-9FE6-FDBC2DE299A9}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

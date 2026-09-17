@@ -1,10 +1,24 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Description>Instant printing for ITBees web applications: a print agent hub (SignalR over WebSocket) on a dedicated port, pairing of the Windows print agent with a user account through the browser, per-user print settings (instant print to a chosen printer or PDF download) and print jobs.</Description>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The agent hub is self-hosted on its own Kestrel listener (see AgentHub/PrintAgentHubHost). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ITBees.Interfaces" Version="8.0.72" />
+    <PackageReference Include="ITBees.Models" Version="8.0.95" />
+    <PackageReference Include="ITBees.RestfulApiControllers" Version="8.0.31" />
+    <PackageReference Include="ITBees.UserManager" Version="8.0.405" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.10" />
+  </ItemGroup>
 
 </Project>
