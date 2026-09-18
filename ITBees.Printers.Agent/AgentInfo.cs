@@ -23,6 +23,16 @@ public static class AgentInfo
 
     public static bool DoNotOpenBrowser => Environment.GetEnvironmentVariable(NoBrowserVariable) == "1";
 
+    /// <summary>
+    /// Diagnostics: when set to "1", jobs are rendered but never handed to the Windows spooler -
+    /// no paper, no print queue entry, and Windows does not make the printer the "last used"
+    /// (default) one. With <see cref="PrintToDirectoryVariable"/> set, the rendered pages are
+    /// saved there as PNG files.
+    /// </summary>
+    public const string DryRunVariable = "ITBEES_PRINT_AGENT_DRY_RUN";
+
+    public static bool DryRun => Environment.GetEnvironmentVariable(DryRunVariable) == "1";
+
     public static string Version { get; } =
         (Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()
             ?.InformationalVersion ?? "1.0.0").Split('+')[0];

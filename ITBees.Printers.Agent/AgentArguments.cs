@@ -2,11 +2,11 @@ namespace ITBees.Printers.Agent;
 
 /// <summary>
 /// Command line of the agent:
-///   ITBees.Printers.Agent.exe --site https://admin.example.com
-/// The site is the web application to log in to. The address may carry a path when the
-/// application serves its "connect print agent" page somewhere else than the default
-/// /print-agent/connect. Without arguments the agent simply reconnects to the services it
-/// already knows.
+///   ITBees.Printers.Agent.exe --site admin.example.com
+/// The site is the base address of the web application to log in to - "https://" may be left
+/// out, and a sub-path the application is hosted under belongs to it ("example.com/adm"). The
+/// connect page (/print-agent/connect) is appended, unless the address already names one.
+/// Without arguments the agent simply reconnects to the services it already knows.
 /// </summary>
 public class AgentArguments
 {

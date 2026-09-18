@@ -52,13 +52,18 @@ public class PdfPrinter
             throw new InvalidOperationException($"Drukarka „{printerName}” nie istnieje na tym komputerze.");
         }
 
+        copies = Math.Clamp(copies, 1, 99);
+        if (AgentInfo.DryRun)
+        {
+            return DryRun(document, printerName, documentName, copies);
+        }
+
         printDocument.DocumentName = documentName;
         printDocument.PrintController = new StandardPrintController(); // no "Printing page..." window
         printDocument.OriginAtMargins = false;
         RedirectFilePrinter(printDocument, documentName);
 
         // Not every driver honors the Copies setting - when it cannot, the pages are repeated.
-        copies = Math.Clamp(copies, 1, 99);
         var driverCopies = copies <= printDocument.PrinterSettings.MaximumCopies;
         if (driverCopies)
         {
@@ -92,6 +97,34 @@ public class PdfPrinter
 
         printDocument.Print();
         return sequence.Count * (driverCopies ? copies : 1);
+    }
+
+    /// <summary>
+    /// Diagnostics (ITBEES_PRINT_AGENT_DRY_RUN): everything but the printing - the document is
+    /// parsed and every page rendered, so a broken PDF still fails, but the spooler never sees it.
+    /// </summary>
+    private int DryRun(PdfDocument document, string printerName, string documentName, int copies)
+    {
+        const int dpi = 150;
+        var directory = AgentInfo.PrintToDirectory;
+        var safeName = string.Concat(documentName.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff");
+
+        for (uint index = 0; index < document.PageCount; index++)
+        {
+            using var page = document.GetPage(index);
+            using var bitmap = Render(page, (int)Math.Round(page.Size.Width / DipsPerInch * dpi),
+                (int)Math.Round(page.Size.Height / DipsPerInch * dpi));
+            if (directory != null)
+            {
+                bitmap.Save(Path.Combine(Directory.CreateDirectory(directory).FullName,
+                    $"{stamp}-{safeName}-page{index + 1}.png"), System.Drawing.Imaging.ImageFormat.Png);
+            }
+        }
+
+        _log.Info($"DRY RUN: \"{documentName}\" rendered for \"{printerName}\" ({document.PageCount} page(s), " +
+                  $"{copies} copy/copies) - nothing was sent to the printer");
+        return (int)document.PageCount * copies;
     }
 
     private void DrawPage(PdfPage page, PrintPageEventArgs e)

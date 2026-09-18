@@ -4,6 +4,7 @@ using ITBees.Printers.Agent.Configuration;
 using ITBees.Printers.Agent.Logging;
 using ITBees.Printers.Agent.Printing;
 using ITBees.Printers.Protocol;
+using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.SignalR.Client;
 
 namespace ITBees.Printers.Agent.Connection;
@@ -26,7 +27,11 @@ public enum ServiceConnectionState
 public class ServiceConnection
 {
     private static readonly TimeSpan PrinterScanInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromSeconds(30);
+
+    // Connecting normally takes well under a second; this only has to beat a request that hangs.
+    private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(20);
 
     private readonly ProfileStore _profileStore;
     private readonly PrinterScanner _scanner;
@@ -34,6 +39,7 @@ public class ServiceConnection
     private readonly AgentLog _log;
     private readonly CancellationTokenSource _stop = new();
     private HubConnection? _connection;
+    private bool _avoidWebSockets;
     private string? _reportedFingerprint;
 
     public ServiceConnection(ServiceProfile profile, ProfileStore profileStore, PrinterScanner scanner,
@@ -80,8 +86,9 @@ public class ServiceConnection
         }
 
         // The reconnecting is done here rather than by SignalR's automatic reconnect: every
-        // (re)connection goes through ConnectWithRetry, so a revoked token always shows up the
+        // (re)connection is a fresh attempt of our own, so a revoked token always shows up the
         // same way - as the 401 of StartAsync - instead of being swallowed by a retry policy.
+        var retryDelay = InitialRetryDelay;
         while (!cancellationToken.IsCancellationRequested && State != ServiceConnectionState.LoginRequired)
         {
             var closed = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -89,10 +96,24 @@ public class ServiceConnection
             _connection = connection;
             try
             {
-                if (!await ConnectWithRetry(connection, cancellationToken))
+                var outcome = await Connect(connection, cancellationToken);
+                if (outcome == ConnectOutcome.Stopped)
                 {
                     return;
                 }
+
+                if (outcome != ConnectOutcome.Connected)
+                {
+                    if (outcome == ConnectOutcome.RetryLater)
+                    {
+                        await Task.Delay(retryDelay, cancellationToken);
+                        retryDelay = TimeSpan.FromSeconds(Math.Min(retryDelay.TotalSeconds * 2, MaxRetryDelay.TotalSeconds));
+                    }
+
+                    continue;
+                }
+
+                retryDelay = InitialRetryDelay;
 
                 // Connected: keep an eye on the printers until the connection goes away.
                 while (await Task.WhenAny(closed.Task, Task.Delay(PrinterScanInterval, cancellationToken)) != closed.Task)
@@ -114,6 +135,10 @@ public class ServiceConnection
                 _log.Warning($"{Profile.DisplayName}: connection lost, reconnecting ({error?.Message ?? "closed by the service"})");
                 SetState(ServiceConnectionState.Connecting, error?.Message);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
             finally
             {
                 await DisposeQuietly(connection);
@@ -124,8 +149,14 @@ public class ServiceConnection
     private HubConnection BuildConnection(string token, TaskCompletionSource<Exception?> closed)
     {
         var connection = new HubConnectionBuilder()
-            .WithUrl(Profile.HubUrl.TrimEnd('/') + PrintAgentProtocol.HubPath,
-                options => options.AccessTokenProvider = () => Task.FromResult<string?>(token))
+            .WithUrl(Profile.HubUrl.TrimEnd('/') + PrintAgentProtocol.HubPath, options =>
+            {
+                options.AccessTokenProvider = () => Task.FromResult<string?>(token);
+                if (_avoidWebSockets)
+                {
+                    options.Transports = HttpTransportType.ServerSentEvents | HttpTransportType.LongPolling;
+                }
+            })
             .Build();
 
         connection.On<AgentPrintJob, AgentPrintJobAck>(PrintAgentProtocol.PrintMethod, HandlePrint);
@@ -156,54 +187,70 @@ public class ServiceConnection
         }
     }
 
-    private async Task<bool> ConnectWithRetry(HubConnection connection, CancellationToken cancellationToken)
+    /// <summary>One connection attempt. A connection object is good for one attempt only - the caller builds the next.</summary>
+    private async Task<ConnectOutcome> Connect(HubConnection connection, CancellationToken cancellationToken)
     {
-        var delay = TimeSpan.FromSeconds(2);
-        while (!cancellationToken.IsCancellationRequested)
+        using var startTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        startTimeout.CancelAfter(StartTimeout);
+        try
         {
-            try
-            {
-                SetState(ServiceConnectionState.Connecting, LastError);
-                await connection.StartAsync(cancellationToken);
-                SetState(ServiceConnectionState.Connected, null);
-                _log.Info($"{Profile.DisplayName}: connected to {Profile.HubUrl}");
-                await ReportPrinters(force: true);
-                return true;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                return false;
-            }
-            catch (Exception e) when (IsUnauthorized(e))
-            {
-                // 401 is final: the agent was removed from the account, or paired again elsewhere.
-                _log.Warning($"{Profile.DisplayName}: the service no longer accepts this agent's token");
-                RequireLogin("Serwis nie rozpoznaje już tej aplikacji - zaloguj się ponownie.");
-                return false;
-            }
-            catch (Exception e)
-            {
-                if (LastError != e.Message)
-                {
-                    _log.Warning($"{Profile.DisplayName}: cannot connect to {Profile.HubUrl}: {e.Message}");
-                }
-
-                SetState(ServiceConnectionState.Disconnected, e.Message);
-            }
-
-            try
-            {
-                await Task.Delay(delay, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                return false;
-            }
-
-            delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, MaxRetryDelay.TotalSeconds));
+            SetState(ServiceConnectionState.Connecting, LastError);
+            await connection.StartAsync(startTimeout.Token);
+            SetState(ServiceConnectionState.Connected, null);
+            _log.Info($"{Profile.DisplayName}: connected to {Profile.HubUrl}" +
+                      (_avoidWebSockets ? " (without WebSockets)" : string.Empty));
+            await ReportPrinters(force: true);
+            return ConnectOutcome.Connected;
         }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            return ConnectOutcome.Stopped;
+        }
+        catch (Exception) when (startTimeout.IsCancellationRequested)
+        {
+            // (SignalR reports a cancelled start as "unable to connect with any of the available
+            // transports", not as an OperationCanceledException - hence the filter on the token.)
+            // Nothing came back in time. SignalR falls back to other transports when a WebSocket
+            // is refused - but not when a proxy on the way swallows the upgrade request and never
+            // answers. From now on this service is reached without WebSockets.
+            if (!_avoidWebSockets)
+            {
+                _avoidWebSockets = true;
+                _log.Warning($"{Profile.DisplayName}: no answer from {Profile.HubUrl} within " +
+                             $"{StartTimeout.TotalSeconds:0} s - retrying without WebSockets");
+                return ConnectOutcome.RetryNow;
+            }
 
-        return false;
+            SetState(ServiceConnectionState.Disconnected, "Serwis nie odpowiada.");
+            return ConnectOutcome.RetryLater;
+        }
+        catch (Exception e) when (IsUnauthorized(e))
+        {
+            // 401 is final: the agent was removed from the account, or paired again elsewhere.
+            _log.Warning($"{Profile.DisplayName}: the service no longer accepts this agent's token");
+            RequireLogin("Serwis nie rozpoznaje już tej aplikacji - zaloguj się ponownie.");
+            return ConnectOutcome.Stopped;
+        }
+        catch (Exception e)
+        {
+            if (LastError != e.Message)
+            {
+                _log.Warning($"{Profile.DisplayName}: cannot connect to {Profile.HubUrl}: {e.Message}");
+            }
+
+            SetState(ServiceConnectionState.Disconnected, e.Message);
+            return ConnectOutcome.RetryLater;
+        }
+    }
+
+    private enum ConnectOutcome
+    {
+        Connected,
+        RetryNow,
+        RetryLater,
+
+        /// <summary>The application is closing, or the service wants a new login.</summary>
+        Stopped
     }
 
     private AgentPrintJobAck HandlePrint(AgentPrintJob job)

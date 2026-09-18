@@ -70,8 +70,11 @@ Ten sam potok (ten sam hub, ten sam rejestr połączeń) jest dostępny dwiema d
    otwarcia w firewallu (także po stronie sieci klienta, która często blokuje nietypowe porty
    wychodzące). To jest droga zalecana dla produkcji.
 
-W obu przypadkach agenci omijają middleware/CORS/JWT aplikacji. Gdy proxy nie przepuszcza
-upgrade'u WebSocket dla tej ścieżki, klient SignalR sam schodzi na SSE / long polling.
+W obu przypadkach agenci omijają middleware/CORS/JWT aplikacji. Gdy proxy odrzuca upgrade
+WebSocket dla tej ścieżki, klient SignalR sam schodzi na SSE / long polling. Gdy proxy go
+**połyka** (żądanie wisi bez odpowiedzi - SignalR wtedy nie przechodzi dalej), agent po 20 s
+przerywa próbę i łączy się z tym serwisem już bez WebSocket (w dzienniku: „retrying without
+WebSockets", potem „connected … (without WebSockets)").
 
 ### Jaki adres dostaje agent
 
@@ -96,12 +99,14 @@ Jak w narzędziach CLI logujących przez przeglądarkę:
 
 1. `ITBees.Printers.Agent.exe --site admin.example.com` (albo „Połącz z serwisem…" w oknie
    agenta) - podaje się **adres panelu WWW**, nie API; brakujące `https://` agent dopisuje sam
-   (`http://` dla localhost). Agent najpierw sprawdza, czy pod adresem w ogóle jest strona
-   łączenia (404 bez powłoki SPA → od razu czytelny błąd „to nie jest adres panelu"), potem
-   otwiera nasłuch na losowym porcie loopback i domyślną przeglądarkę na
-   `{site}/print-agent/connect?port=…&state=…&machine=…` (jeśli `--site` ma własną ścieżkę,
-   używana jest ona zamiast domyślnej). Logowanie w toku widać w oknie agenta; ponowne wywołanie
-   dla tego samego serwisu zastępuje poprzednią próbę, a „Anuluj logowanie" ją przerywa.
+   (`http://` dla localhost). Panel wystawiony pod podścieżką podaje się razem z nią
+   (`kilometrowka.net/adm` → `https://kilometrowka.net/adm/print-agent/connect`); adres, który
+   już wskazuje stronę łączenia (zawiera `print-agent`), jest brany bez zmian. Agent najpierw
+   sprawdza, czy pod adresem w ogóle jest strona łączenia (404 bez powłoki SPA → od razu czytelny
+   błąd „to nie jest adres panelu"), potem otwiera nasłuch na losowym porcie loopback i domyślną
+   przeglądarkę na `{site}/print-agent/connect?port=…&state=…&machine=…`. Logowanie w toku widać
+   w oknie agenta; ponowne wywołanie dla tego samego serwisu zastępuje poprzednią próbę, a
+   „Anuluj logowanie" ją przerywa.
 2. Strona hosta (za zwykłym logowaniem użytkownika) pokazuje nazwę komputera i prosi o
    potwierdzenie. Po kliknięciu woła `POST /PrintAgentRegistration` (autoryzowane JWT
    użytkownika) i przekierowuje przeglądarkę na
@@ -132,7 +137,14 @@ wieloma serwisami (osobny port/token dla każdego).
 Frontend przy „Drukuj": pobiera PDF jak dotąd → `GET /PrintSettings?documentType=` → jeśli
 efektywnie „natychmiast" i drukarka gotowa, `POST /PrintJob`, w przeciwnym razie (i przy każdym
 błędzie / `shouldFallBackToPdf`) otwiera PDF. Wzorzec: `ITBees.Printers.DevHost/wwwroot/index.html`
-oraz `InstantPrintService` w octoparkadmin.
+oraz `InstantPrintService` w octoparkadmin i kilometrowka-adm.
+
+### Podłączeni hości
+
+| Host | Panel / strona łączenia | Typy dokumentów |
+|---|---|---|
+| Octopark AdminApi | octoparkadmin: Ustawienia → Drukowanie, `/print-agent/connect` | `StockLabel` (etykiety magazynowe 50 × 30 mm) |
+| Kilometrówka Api | kilometrowka-adm: menu „Drukowanie", `/print-agent/connect` (poza powłoką panelu, powrót po logowaniu przez własne guardy) | `InpostLabel` (etykiety InPost A6 - ITBees.Inpost `?type=A6`) |
 
 Dokument nigdy nie jest zapisywany na serwerze - historia (`PrintJob`) trzyma tylko metadane i
 jest przycinana po `PrintJobRetentionDays` (domyślnie 30).
@@ -149,7 +161,8 @@ jest przycinana po `PrintJobRetentionDays` (domyślnie 30).
   i wyśrodkowana (etykieta 50 × 30 mm na rolce 50 × 30 mm ląduje dokładnie), większa jest
   zmniejszana do obszaru zadruku; orientacja dobierana do papieru. Kopie przez sterownik, a gdy
   ich nie obsługuje - przez powtórzenie stron.
-- Połączenie: własna pętla reconnect z back-offem (2 s → 30 s) bez końca; 401 = token
+- Połączenie: własna pętla reconnect z back-offem (2 s → 30 s) bez końca; każda próba to nowe
+  połączenie z limitem 20 s (potem - raz - próba bez WebSocket, patrz wyżej); 401 = token
   unieważniony → stan „wymaga zalogowania".
 - Dziennik: `%LocalAppData%\ITBees\PrintAgent\logs\agent-yyyyMMdd.log` (14 dni). Bez treści
   dokumentów, tokenów i kodów.
@@ -157,7 +170,11 @@ jest przycinana po `PrintJobRetentionDays` (domyślnie 30).
 Zmienne środowiskowe do diagnostyki / testów: `ITBEES_PRINT_AGENT_DATA_DIR` (osobny katalog
 profili), `ITBEES_PRINT_AGENT_NO_BROWSER=1` (adres logowania do dziennika zamiast przeglądarki),
 `ITBEES_PRINT_AGENT_PRINT_TO_DIR` (drukarki „do pliku", np. Microsoft Print to PDF, zapisują tam
-zamiast pytać o nazwę pliku).
+zamiast pytać o nazwę pliku), `ITBEES_PRINT_AGENT_DRY_RUN=1` (dokument jest parsowany i
+renderowany, ale nie trafia do spoolera - z `PRINT_TO_DIR` strony zapisują się jako PNG). Tryb
+„na sucho" jest wart używania w testach: każdy prawdziwy wydruk Windows (przy włączonym
+„Zezwalaj systemowi Windows na zarządzanie drukarką domyślną") robi z użytej drukarki drukarkę
+domyślną.
 
 ## Piaskownica
 

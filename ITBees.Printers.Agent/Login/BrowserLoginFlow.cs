@@ -104,11 +104,17 @@ public class BrowserLoginFlow
             throw new ArgumentException($"„{siteUrl}” nie jest poprawnym adresem serwisu.");
         }
 
+        // The address is the base of the web application - at the root of its host or under a
+        // sub-path ("kilometrowka.net/adm") - and the connect page hangs off it. Only an address
+        // that already names a connect page (a custom one included) is taken as it is.
         var builder = new UriBuilder(normalized);
-        if (string.IsNullOrEmpty(builder.Path) || builder.Path == "/")
+        var path = builder.Path.TrimEnd('/');
+        if (!path.Contains("print-agent", StringComparison.OrdinalIgnoreCase))
         {
-            builder.Path = PrintAgentProtocol.DefaultConnectPagePath;
+            path += PrintAgentProtocol.DefaultConnectPagePath;
         }
+
+        builder.Path = path;
 
         var query = HttpUtility.ParseQueryString(builder.Query);
         query[PrintAgentProtocol.PortParameter] = port.ToString();

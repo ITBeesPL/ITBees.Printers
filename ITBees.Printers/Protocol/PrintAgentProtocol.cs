@@ -27,7 +27,8 @@ public static class PrintAgentProtocol
 
     /// <summary>
     /// Page of the web application that asks the logged-in user to connect the agent. Appended
-    /// to the site address the agent was started with, unless that address carries a path itself.
+    /// to the site address the agent was started with (its sub-path included), unless that
+    /// address already names a connect page itself.
     /// </summary>
     public const string DefaultConnectPagePath = "/print-agent/connect";
 
