@@ -214,6 +214,54 @@ jest przycinana po `PrintJobRetentionDays` (domyślnie 30).
 - Dziennik: `%LocalAppData%\ITBees\PrintAgent\logs\agent-yyyyMMdd.log` (14 dni). Bez treści
   dokumentów, tokenów i kodów.
 
+### Aktualizacje agenta
+
+Opublikowany agent (jeden plik exe, np. `ITBeesFastPrintAgent.exe`) przy **każdym starcie** czyta
+`https://api.itbees.pl/ITBeesFastPrintAgent/latestversion.json`. Jeśli opublikowana wersja jest
+wyższa od własnej, pyta w oknie „Aktualizuj / Nie teraz". Po odmowie zapyta przy następnym
+starcie. Plik generuje build (TeamCity, zaraz po `dotnet publish ... -p:Version=%build.number%`):
+
+```json
+{
+  "version": "1.0.42",
+  "fileName": "ITBeesFastPrintAgent.exe",
+  "size": 78637439,
+  "sha256": "e4e8b56a…",
+  "publishedAt": "2026-09-18T18:28:43+00:00"
+}
+```
+
+Wymagane są `version` i `fileName` (exe leży obok JSON-a) albo `downloadUrl` (pełny lub względny
+adres). `size` i `sha256` są sprawdzane, jeśli są podane. Na serwer wgrywa się najpierw exe,
+a JSON na końcu - inaczej klient może zobaczyć wersję, której pliku jeszcze nie ma.
+
+Przebieg po kliknięciu „Aktualizuj":
+
+1. Pobranie do `ITBeesFastPrintAgent.update.exe` obok działającego exe (z paskiem postępu,
+   anulowalne). Sprawdzane są nagłówek `MZ`, rozmiar i SHA-256. Przy błędzie komunikat zostaje
+   w oknie, a plik jest usuwany.
+2. Agent zamyka się (rozłącza serwisy, zwalnia blokadę jednej instancji) i uruchamia
+   `….update.exe --apply-update "<ścieżka exe>" <pid>`.
+3. Nowa wersja czeka na koniec starego procesu, kopiuje się do `<exe>.tmp`, jednym `rename`
+   nadpisuje stary exe (ta sama ścieżka, więc wpis „Uruchamiaj przy starcie Windows" dalej
+   działa) i startuje go z `--minimized --updated`. Pokazuje się dymek „Zaktualizowano do wersji
+   …", a ten proces usuwa `.update.exe`.
+4. Jeśli cokolwiek w kroku 2 lub 3 się nie uda, startuje dotychczasowy exe z `--update-failed`
+   (dymek „Aktualizacja nie powiodła się"). Użytkownik nigdy nie zostaje bez działającego agenta.
+
+Dlaczego nie „zmień nazwę działającego exe i podłóż nowy": aplikacja single-file doładowuje
+biblioteki ze swojego exe leniwie. Po podmianie pliku pod jej ścieżką proces nie potrafił już
+nawet uruchomić innego procesu. Argument `--apply-update` to kontrakt między kolejnymi wersjami
+i nie należy go zmieniać.
+
+Ograniczenia: aktualizuje się tylko build single-file (build z `bin\` to exe + DLL-e, pomija
+sprawdzanie). Folder z exe musi być zapisywalny - w `Program Files` okno pokaże błąd z linkiem do
+ręcznego pobrania. Tylko https (http wyłącznie dla serwera testowego na tym komputerze).
+SHA-256 z tego samego serwera chroni przed uszkodzonym pobraniem, nie przed podmianą na
+serwerze - tę lukę zamknęłoby podpisywanie exe (Authenticode) i sprawdzanie podpisu przed
+uruchomieniem. Zamknięcie i ponowny start z pobraną wersją trwa kilkanaście sekund (m.in.
+skanowanie antywirusowe nowego 75-megabajtowego exe) i w tym czasie ikony nie ma w zasobniku.
+
 Zmienne środowiskowe do diagnostyki / testów: `ITBEES_PRINT_AGENT_DATA_DIR` (osobny katalog
 profili), `ITBEES_PRINT_AGENT_NO_BROWSER=1` (adres logowania do dziennika zamiast przeglądarki),
 `ITBEES_PRINT_AGENT_PRINT_TO_DIR` (drukarki „do pliku", np. Microsoft Print to PDF, zapisują tam
@@ -222,7 +270,9 @@ renderowany, ale nie trafia do spoolera - z `PRINT_TO_DIR` strony zapisują się
 `ITBEES_PRINT_AGENT_TRACE=1` (dziennik klienta SignalR - negocjacja, transporty, handshake - do
 pliku dziennika jako linie `[TRC]`, bez tokenów i treści dokumentów; tak widać, co robi proxy po
 drodze), `ITBEES_PRINT_AGENT_TRANSPORTS` (np. `LongPolling` albo `ServerSentEvents,LongPolling` -
-tylko te transporty, bez schodzenia po kolei). Tryb
+tylko te transporty, bez schodzenia po kolei), `ITBEES_PRINT_AGENT_UPDATE_URL` (inny adres
+`latestversion.json`, np. `http://127.0.0.1:5399/ITBeesFastPrintAgent/latestversion.json`, albo
+`off` - bez sprawdzania aktualizacji). Tryb
 „na sucho" jest wart używania w testach: każdy prawdziwy wydruk Windows (przy włączonym
 „Zezwalaj systemowi Windows na zarządzanie drukarką domyślną") robi z użytej drukarki drukarkę
 domyślną.

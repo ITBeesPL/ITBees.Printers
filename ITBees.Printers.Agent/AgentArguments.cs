@@ -10,6 +10,12 @@ namespace ITBees.Printers.Agent;
 /// </summary>
 public class AgentArguments
 {
+    /// <summary>Passed by the previous version to the copy it has just been updated to.</summary>
+    public const string UpdatedArgument = "--updated";
+
+    /// <summary>Passed to the previous version when the new one could not be installed.</summary>
+    public const string UpdateFailedArgument = "--update-failed";
+
     public string? SiteUrl { get; private set; }
 
     /// <summary>Start without showing the status window (used by the autostart entry).</summary>
@@ -17,6 +23,11 @@ public class AgentArguments
 
     /// <summary>Close down - sent by another copy of the agent taking this one's place (see <see cref="SingleInstance"/>).</summary>
     public bool Quit { get; private set; }
+
+    /// <summary>Started by the previous version right after installing this one (see <see cref="Updates.AgentUpdater"/>).</summary>
+    public bool Updated { get; private set; }
+
+    public bool UpdateFailed { get; private set; }
 
     public static AgentArguments Parse(IReadOnlyList<string> args)
     {
@@ -42,6 +53,14 @@ public class AgentArguments
             else if (string.Equals(arg, SingleInstance.QuitArgument, StringComparison.OrdinalIgnoreCase))
             {
                 result.Quit = true;
+            }
+            else if (string.Equals(arg, UpdatedArgument, StringComparison.OrdinalIgnoreCase))
+            {
+                result.Updated = true;
+            }
+            else if (string.Equals(arg, UpdateFailedArgument, StringComparison.OrdinalIgnoreCase))
+            {
+                result.UpdateFailed = true;
             }
             else if (result.SiteUrl == null && !arg.StartsWith('-') && !arg.StartsWith('/'))
             {

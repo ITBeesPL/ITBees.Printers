@@ -1,4 +1,5 @@
 using ITBees.Printers.Agent.Connection;
+using ITBees.Printers.Agent.Updates;
 
 namespace ITBees.Printers.Agent.Ui;
 
@@ -11,12 +12,16 @@ public sealed class AgentApplicationContext : ApplicationContext
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _autoStartItem;
     private readonly Control _uiThread = new();
+    private readonly AgentUpdater _updater;
     private StatusForm? _statusForm;
+    private UpdateDialog? _updateDialog;
+    private bool _exiting;
 
     public AgentApplicationContext(AgentRuntime runtime, SingleInstance singleInstance, AgentArguments arguments)
     {
         _runtime = runtime;
         _singleInstance = singleInstance;
+        _updater = new AgentUpdater(runtime.Log);
         _uiThread.CreateControl(); // a handle on the UI thread, to marshal background events onto it
 
         _autoStartItem = new ToolStripMenuItem("Uruchamiaj przy starcie Windows") { CheckOnClick = true };
@@ -50,7 +55,23 @@ public sealed class AgentApplicationContext : ApplicationContext
         UpdateTrayIcon();
         AnnounceReplacedCopy();
         HandleArguments(arguments, showWindow: !arguments.Minimized);
+
+        _updater.RemoveLeftovers();
+        if (arguments.Updated)
+        {
+            ShowBalloon(NoticeKind.Info, AgentInfo.ProductName, $"Zaktualizowano do wersji {AgentInfo.Version}.");
+        }
+        else if (arguments.UpdateFailed)
+        {
+            ShowBalloon(NoticeKind.Warning, "Aktualizacja nie powiodła się",
+                "Działa dotychczasowa wersja programu. Szczegóły są w dzienniku.");
+        }
+
+        _ = CheckForUpdate();
     }
+
+    /// <summary>Set when the agent closes to make way for an update - Program then starts the new version.</summary>
+    public DownloadedUpdate? PendingUpdate { get; private set; }
 
     private void HandleArguments(AgentArguments arguments, bool showWindow)
     {
@@ -91,6 +112,31 @@ public sealed class AgentApplicationContext : ApplicationContext
 
         ShowBalloon(NoticeKind.Info, AgentInfo.ProductName,
             $"Zastąpiono wcześniej uruchomioną kopię aplikacji ({replaced}).");
+    }
+
+    /// <summary>On every start: a newer published version is offered until the user takes it.</summary>
+    private async Task CheckForUpdate()
+    {
+        var update = await _updater.Check(CancellationToken.None);
+        if (update == null || _exiting)
+        {
+            return;
+        }
+
+        using var dialog = new UpdateDialog(_updater, update, _icons.Connected);
+        _updateDialog = dialog;
+        var result = dialog.ShowDialog();
+        _updateDialog = null;
+        if (result != DialogResult.OK || dialog.Downloaded is not { } downloaded)
+        {
+            _runtime.Log.Info($"Update {update.Version} not installed - it will be offered again on the next start");
+            return;
+        }
+
+        // The new version can only start once this one has released the single-instance lock -
+        // Program does that after the message loop ends.
+        PendingUpdate = downloaded;
+        await Exit();
     }
 
     private void ShowStatusForm()
@@ -161,6 +207,13 @@ public sealed class AgentApplicationContext : ApplicationContext
 
     private async Task Exit()
     {
+        if (_exiting)
+        {
+            return;
+        }
+
+        _exiting = true;
+        _updateDialog?.Close();
         _trayIcon.Visible = false;
         await _runtime.Shutdown();
         ExitThread();

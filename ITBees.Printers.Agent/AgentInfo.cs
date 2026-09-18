@@ -49,6 +49,12 @@ public static class AgentInfo
     /// </summary>
     public const string TransportsVariable = "ITBEES_PRINT_AGENT_TRANSPORTS";
 
+    /// <summary>
+    /// Diagnostics: another address of the update manifest (latestversion.json) - e.g. a test
+    /// server on this computer - or "off" to skip the update check.
+    /// </summary>
+    public const string UpdateUrlVariable = "ITBEES_PRINT_AGENT_UPDATE_URL";
+
     public static string Version { get; } =
         (Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()
             ?.InformationalVersion ?? "1.0.0").Split('+')[0];
