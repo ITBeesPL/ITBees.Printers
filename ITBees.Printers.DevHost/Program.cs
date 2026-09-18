@@ -8,13 +8,17 @@ using ITBees.UserManager.Interfaces;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.EntityFrameworkCore;
 
-// Development sandbox - see the csproj. API + a test page on :5190, print agents on :5191.
+// Development sandbox - see the csproj. API + a test page on :5190, print agents on :5191
+// (and, like in every host of the library, on the API's own port too).
 //   dotnet run --project ITBees.Printers.DevHost
-//   ITBees.Printers.Agent.exe --site http://localhost:5190
-const int apiPort = 5190;
-const int agentPort = 5191;
-
+//   ITBees.Printers.Agent.exe --site localhost:5190
+// A second instance next to a running one: --ApiPort=5290 --AgentPort=5291 (0 = no dedicated port),
+// --ExposeOnApplicationPort=false to leave the agents only the dedicated port.
 var builder = WebApplication.CreateBuilder(args);
+var apiPort = builder.Configuration.GetValue("ApiPort", 5190);
+var agentPort = builder.Configuration.GetValue("AgentPort", 5191);
+var exposeOnApplicationPort = builder.Configuration.GetValue("ExposeOnApplicationPort", true);
+
 builder.WebHost.ConfigureKestrel(kestrel => kestrel.ListenLocalhost(apiPort));
 
 builder.Services.AddDbContextFactory<DevHostContext>(options => options.UseInMemoryDatabase("ITBees.Printers.DevHost"));
@@ -34,6 +38,7 @@ new PrintersSetup().Register(builder.Services, new PrintersSettings
 {
     ServiceName = "ITBees.Printers sandbox",
     AgentPort = agentPort,
+    ExposeOnApplicationPort = exposeOnApplicationPort,
     DocumentTypes =
     {
         new PrintDocumentType("StockLabel", "Etykiety magazynowe 50 x 30 mm"),

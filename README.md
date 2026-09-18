@@ -29,7 +29,8 @@ new ITBees.Printers.Setup.PrintersSetup().Register(builder.Services, new Printer
 {
     ServiceName = "Octopark Admin",          // nazwa pokazywana w aplikacji agenta
     AgentPort = 7081,                        // dedykowany port dla agentów; 0 = wyłączone
-    PublicAgentUrl = "https://adminapi.example.com:7443", // gdy port stoi za reverse proxy / TLS
+    ExposeOnApplicationPort = true,          // (domyślnie) te same końcówki także na porcie API
+    PublicAgentUrl = null,                   // zwykle puste - patrz „Jaki adres dostaje agent"
     RequiredRole = Role.PlatformOperator,    // null = każdy zalogowany użytkownik
     DocumentTypes = { new PrintDocumentType("StockLabel", "Etykiety magazynowe 50 × 30 mm") }
 });
@@ -47,34 +48,60 @@ Host z jawną listą kontrolerów dopisuje: `PrintAgentRegistrationController`, 
 Wymagania: generyczne repozytoria ITBees (`IReadOnlyRepository<>` / `IWriteOnlyRepository<>`),
 `IAspCurrentUserService` (ITBees.UserManager), encja `UserAccount` w DbContext hosta.
 
-### Dedykowany port
+### Końcówki agenta: dedykowany port i port aplikacji
 
-Samo zarejestrowanie biblioteki (`PrintersSetup.Register`) otwiera przy starcie aplikacji
-**osobny listener Kestrel** na `AgentPort` (usługa hostowana `PrintAgentHubHost`). Konfiguracja
-Kestrela hosta (`ListenAnyIP`, `ASPNETCORE_URLS`) nie jest ruszana, a agenci nie przechodzą
-przez middleware/CORS/JWT aplikacji. Zajęty port nie wywraca aplikacji - loguje błąd, a przyciski
-„Drukuj" po prostu otwierają PDF.
-
-Na porcie działają tylko:
+Samo zarejestrowanie biblioteki (`PrintersSetup.Register`) uruchamia przy starcie aplikacji
+usługę `PrintAgentHubHost` - drugi, minimalny host WWW z własnym kontenerem DI, który serwuje
+tylko:
 
 - `GET  /print-agent/info` - nazwa serwisu i wersja protokołu (anonimowo),
 - `POST /print-agent/register` - wymiana jednorazowego kodu na token agenta (anonimowo),
 - `/print-agent/hub` - hub SignalR; wymaga tokenu agenta (`Authorization: Bearer` lub `?access_token=`).
 
-W produkcji port musi być osiągalny z komputerów użytkowników i szyfrowany (token agenta
-podróżuje w nagłówku): najprościej terminacja TLS na reverse proxy z przekazywaniem WebSocket
-(nginx: `proxy_http_version 1.1; Upgrade/Connection`) i wskazanie adresu w `PublicAgentUrl`.
-Bez `PublicAgentUrl` adres jest wyprowadzany z żądania parującego (ten sam host, `AgentPort`) -
-wystarcza w dev i on-premise bez proxy.
+Ten sam potok (ten sam hub, ten sam rejestr połączeń) jest dostępny dwiema drogami:
+
+1. **Dedykowany port** `AgentPort` - osobny listener Kestrel. Konfiguracja Kestrela hosta
+   (`ListenAnyIP`, `ASPNETCORE_URLS`) nie jest ruszana. Zajęty port nie wywraca aplikacji.
+2. **Port aplikacji** (`ExposeOnApplicationPort`, domyślnie włączone) - `IStartupFilter` wstawia
+   na początek potoku hosta middleware, które przejmuje wyłącznie trzy powyższe ścieżki (reszta,
+   łącznie z ewentualną stroną `/print-agent/connect` frontendu, trafia do aplikacji bez zmian).
+   Zero zmian w `Program.cs`. Agenci wchodzą wtedy **przez adres, pod którym API już jest
+   opublikowane** - to samo reverse proxy, ten sam certyfikat TLS, żadnego nowego portu do
+   otwarcia w firewallu (także po stronie sieci klienta, która często blokuje nietypowe porty
+   wychodzące). To jest droga zalecana dla produkcji.
+
+W obu przypadkach agenci omijają middleware/CORS/JWT aplikacji. Gdy proxy nie przepuszcza
+upgrade'u WebSocket dla tej ścieżki, klient SignalR sam schodzi na SSE / long polling.
+
+### Jaki adres dostaje agent
+
+Adres (`HubUrl`) wydaje `POST /PrintAgentRegistration`, w tej kolejności:
+
+1. `PublicAgentUrl`, jeśli ustawione (brak schematu = `https://`; dla localhost `http://`). Używaj
+   tylko, gdy agenci mają wchodzić inaczej niż API - np. dedykowany port za terminatorem TLS:
+   `"https://adminapi.example.com:7443"`.
+2. Przy `ExposeOnApplicationPort`: **adres, pod którym frontend sam sięga do API** - strona
+   łączenia przesyła go w `PrintAgentRegistrationIm.ApiUrl` (w Angularze: `environment.webApiUrl`).
+   To jedyny adres, o którym wiadomo, że działa z komputera użytkownika, łącznie ze schematem
+   (aplikacja za proxy terminującym TLS widzi u siebie zwykłe `http`). Działa bez konfiguracji
+   na produkcji i na localhost.
+3. Dalej: pochodzenie żądania (`X-Forwarded-Proto/Host`, potem `Request.Scheme/Host`).
+4. Bez `ExposeOnApplicationPort`: host żądania + `AgentPort` (dev, on-premise bez proxy) - wtedy
+   port musi być osiągalny z komputerów użytkowników, a w produkcji szyfrowany (token agenta
+   podróżuje w nagłówku).
 
 ## Logowanie agenta (parowanie z kontem)
 
 Jak w narzędziach CLI logujących przez przeglądarkę:
 
-1. `ITBees.Printers.Agent.exe --site https://admin.example.com` - agent otwiera nasłuch na
-   losowym porcie loopback i domyślną przeglądarkę na
+1. `ITBees.Printers.Agent.exe --site admin.example.com` (albo „Połącz z serwisem…" w oknie
+   agenta) - podaje się **adres panelu WWW**, nie API; brakujące `https://` agent dopisuje sam
+   (`http://` dla localhost). Agent najpierw sprawdza, czy pod adresem w ogóle jest strona
+   łączenia (404 bez powłoki SPA → od razu czytelny błąd „to nie jest adres panelu"), potem
+   otwiera nasłuch na losowym porcie loopback i domyślną przeglądarkę na
    `{site}/print-agent/connect?port=…&state=…&machine=…` (jeśli `--site` ma własną ścieżkę,
-   używana jest ona zamiast domyślnej).
+   używana jest ona zamiast domyślnej). Logowanie w toku widać w oknie agenta; ponowne wywołanie
+   dla tego samego serwisu zastępuje poprzednią próbę, a „Anuluj logowanie" ją przerywa.
 2. Strona hosta (za zwykłym logowaniem użytkownika) pokazuje nazwę komputera i prosi o
    potwierdzenie. Po kliknięciu woła `POST /PrintAgentRegistration` (autoryzowane JWT
    użytkownika) i przekierowuje przeglądarkę na
@@ -135,9 +162,12 @@ zamiast pytać o nazwę pliku).
 ## Piaskownica
 
 ```
-dotnet run --project ITBees.Printers.DevHost        # API + strona testowa: http://localhost:5190, agenci: 5191
-ITBees.Printers.Agent.exe --site http://localhost:5190
+dotnet run --project ITBees.Printers.DevHost        # API + strona testowa: http://localhost:5190, agenci: 5190 i 5191
+ITBees.Printers.Agent.exe --site localhost:5190
 ```
+
+Druga instancja obok działającej: `--ApiPort=5290 --AgentPort=5291`; `--AgentPort=0` wyłącza
+dedykowany port, `--ExposeOnApplicationPort=false` zostawia agentom tylko jego.
 
 Strona `index.html` piaskownicy pokazuje agentów i drukarki, ustawienia, drukuje stronę testową i
 dowolny wgrany PDF. Baza jest w pamięci - po restarcie agent dostaje 401 i loguje się ponownie.

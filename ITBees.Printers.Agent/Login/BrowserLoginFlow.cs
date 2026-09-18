@@ -33,7 +33,14 @@ public class BrowserLoginFlow
 {
     private static readonly TimeSpan LoginTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan RequestReadTimeout = TimeSpan.FromSeconds(5);
-    private static readonly HttpClient HttpClient = new() { Timeout = TimeSpan.FromSeconds(30) };
+    private static readonly TimeSpan PageCheckTimeout = TimeSpan.FromSeconds(10);
+
+    // Redirects are followed by hand: the automatic ones turn a POST into a GET, which is
+    // exactly what an http -> https redirect in front of the registration endpoint would hit.
+    private static readonly HttpClient HttpClient = new(new HttpClientHandler { AllowAutoRedirect = false })
+    {
+        Timeout = TimeSpan.FromSeconds(30)
+    };
 
     private readonly AgentLog _log;
 
@@ -42,6 +49,7 @@ public class BrowserLoginFlow
         _log = log;
     }
 
+    /// <param name="siteUrl">Already normalized - see <see cref="AddressNormalizer"/>.</param>
     public async Task<LoginResult> Run(string siteUrl, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -55,6 +63,8 @@ public class BrowserLoginFlow
             var port = ((IPEndPoint)listener.LocalEndpoint).Port;
             var state = CreateState();
             var connectPageUrl = BuildConnectPageUrl(siteUrl, port, state);
+
+            await EnsureConnectPageExists(siteUrl, connectPageUrl, timeout.Token);
 
             if (AgentInfo.DoNotOpenBrowser)
             {
@@ -89,13 +99,12 @@ public class BrowserLoginFlow
 
     public static string BuildConnectPageUrl(string siteUrl, int port, string state)
     {
-        if (!Uri.TryCreate(siteUrl.Trim(), UriKind.Absolute, out var site) ||
-            (site.Scheme != Uri.UriSchemeHttp && site.Scheme != Uri.UriSchemeHttps))
+        if (!AddressNormalizer.TryNormalize(siteUrl, out var normalized))
         {
-            throw new ArgumentException($"„{siteUrl}” nie jest poprawnym adresem serwisu (http/https).");
+            throw new ArgumentException($"„{siteUrl}” nie jest poprawnym adresem serwisu.");
         }
 
-        var builder = new UriBuilder(site);
+        var builder = new UriBuilder(normalized);
         if (string.IsNullOrEmpty(builder.Path) || builder.Path == "/")
         {
             builder.Path = PrintAgentProtocol.DefaultConnectPagePath;
@@ -107,6 +116,48 @@ public class BrowserLoginFlow
         query[PrintAgentProtocol.MachineParameter] = AgentInfo.MachineName;
         builder.Query = query.ToString();
         return builder.Uri.AbsoluteUri;
+    }
+
+    /// <summary>
+    /// Fails fast - before a browser tab with an error page pops up and the agent waits for a
+    /// confirmation that can never come - when the address is dead or is not a web panel at all
+    /// (the classic: the address of the API instead of the address of the panel).
+    /// </summary>
+    private async Task EnsureConnectPageExists(string siteUrl, string connectPageUrl,
+        CancellationToken cancellationToken)
+    {
+        using var pageTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        pageTimeout.CancelAfter(PageCheckTimeout);
+        try
+        {
+            using var response = await HttpClient.GetAsync(connectPageUrl, HttpCompletionOption.ResponseHeadersRead,
+                pageTimeout.Token);
+            if (response.StatusCode != HttpStatusCode.NotFound)
+            {
+                return; // Anything else (a login redirect included) is for the browser to deal with.
+            }
+
+            // Some static hostings answer 404 and still serve the single-page application -
+            // only a 404 that is not an application shell means "no such page".
+            var body = await response.Content.ReadAsStringAsync(pageTimeout.Token);
+            if (response.Content.Headers.ContentType?.MediaType == "text/html" &&
+                body.Contains("<script", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+        catch (HttpRequestException e)
+        {
+            throw new InvalidOperationException($"Nie można połączyć się z {siteUrl}: {e.Message}");
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException($"Serwis {siteUrl} nie odpowiada.");
+        }
+
+        throw new InvalidOperationException(
+            $"Pod adresem {siteUrl} nie ma strony logowania aplikacji drukującej. Podaj adres panelu WWW, " +
+            "w którym się logujesz (np. https://admin.example.com) - nie adres API.");
     }
 
     /// <summary>Null - not the callback we are waiting for (favicon, a stray or forged request); keep listening.</summary>
@@ -171,43 +222,100 @@ public class BrowserLoginFlow
             throw new InvalidOperationException("Serwis nie przekazał danych potrzebnych do połączenia.");
         }
 
-        if (!Uri.TryCreate(hubUrl.Trim(), UriKind.Absolute, out var hub) ||
-            (hub.Scheme != Uri.UriSchemeHttp && hub.Scheme != Uri.UriSchemeHttps))
+        // Tolerant on purpose: a service configured with a bare "api.example.com" still works.
+        if (!AddressNormalizer.TryNormalize(hubUrl, out var baseUrl))
         {
-            throw new InvalidOperationException("Serwis podał nieprawidłowy adres portu aplikacji drukującej.");
-        }
-
-        if (hub.Scheme == Uri.UriSchemeHttp && !hub.IsLoopback)
-        {
-            _log.Warning($"The agent listener {hub.GetLeftPart(UriPartial.Authority)} is not encrypted (http)");
-        }
-
-        var baseUrl = hub.AbsoluteUri.TrimEnd('/');
-        using var response = await HttpClient.PostAsJsonAsync(baseUrl + PrintAgentProtocol.RegisterPath,
-            new AgentRegistrationRequest
-            {
-                Code = code,
-                MachineName = AgentInfo.MachineName,
-                AgentVersion = AgentInfo.Version,
-                OsVersion = AgentInfo.OsVersion
-            }, cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var error = await TryRead<AgentErrorResponse>(response, cancellationToken);
             throw new InvalidOperationException(
-                $"Serwis odrzucił połączenie ({(int)response.StatusCode}): {error?.Message ?? response.ReasonPhrase}");
+                $"Serwis podał nieprawidłowy adres dla aplikacji drukującej: „{hubUrl}”.");
         }
 
-        var registration = await TryRead<AgentRegistrationResponse>(response, cancellationToken);
-        if (registration == null || string.IsNullOrEmpty(registration.Token))
+        var request = new AgentRegistrationRequest
         {
-            throw new InvalidOperationException("Serwis nie zwrócił tokenu aplikacji drukującej.");
+            Code = code,
+            MachineName = AgentInfo.MachineName,
+            AgentVersion = AgentInfo.Version,
+            OsVersion = AgentInfo.OsVersion
+        };
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await HttpClient.PostAsJsonAsync(baseUrl + PrintAgentProtocol.RegisterPath, request,
+                cancellationToken);
+
+            // A proxy upgrading http to https: repeat the POST there, and talk https from now on.
+            if (IsRedirect(response.StatusCode) &&
+                TryGetSecureTwin(baseUrl, response.Headers.Location, out var secureBaseUrl))
+            {
+                response.Dispose();
+                baseUrl = secureBaseUrl;
+                response = await HttpClient.PostAsJsonAsync(baseUrl + PrintAgentProtocol.RegisterPath, request,
+                    cancellationToken);
+            }
+        }
+        catch (HttpRequestException e)
+        {
+            throw new InvalidOperationException(
+                $"Nie można połączyć się z adresem aplikacji drukującej serwisu ({baseUrl}): {e.Message}");
         }
 
-        var name = string.IsNullOrWhiteSpace(registration.ServiceName) ? serviceName : registration.ServiceName;
-        return new LoginResult(baseUrl, string.IsNullOrWhiteSpace(name) ? hub.Host : name!, registration.AgentGuid,
-            registration.Token);
+        using (response)
+        {
+            if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed)
+            {
+                // The one-time code is spent on nothing, but the message is worth it: this is a
+                // deployment problem of the service, not something the user did wrong.
+                throw new InvalidOperationException(
+                    $"Serwis nie udostępnia aplikacjom drukującym adresu {baseUrl} (HTTP {(int)response.StatusCode}). " +
+                    "Administrator serwisu musi wystawić końcówki /print-agent/ pod adresem z ustawienia PublicAgentUrl.");
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await TryRead<AgentErrorResponse>(response, cancellationToken);
+                throw new InvalidOperationException(
+                    $"Serwis odrzucił połączenie ({(int)response.StatusCode}): {error?.Message ?? response.ReasonPhrase}");
+            }
+
+            var registration = await TryRead<AgentRegistrationResponse>(response, cancellationToken);
+            if (registration == null || string.IsNullOrEmpty(registration.Token))
+            {
+                throw new InvalidOperationException("Serwis nie zwrócił tokenu aplikacji drukującej.");
+            }
+
+            var hub = new Uri(baseUrl);
+            if (hub.Scheme == Uri.UriSchemeHttp && !hub.IsLoopback)
+            {
+                _log.Warning($"The agent address {baseUrl} is not encrypted (http)");
+            }
+
+            var name = string.IsNullOrWhiteSpace(registration.ServiceName) ? serviceName : registration.ServiceName;
+            return new LoginResult(baseUrl, string.IsNullOrWhiteSpace(name) ? hub.Host : name!,
+                registration.AgentGuid, registration.Token);
+        }
+    }
+
+    private static bool IsRedirect(HttpStatusCode statusCode)
+    {
+        return statusCode is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or
+            HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect;
+    }
+
+    /// <summary>Only the same host over https is followed - never a redirect to somewhere else.</summary>
+    private static bool TryGetSecureTwin(string baseUrl, Uri? location, out string secureBaseUrl)
+    {
+        secureBaseUrl = string.Empty;
+        var current = new Uri(baseUrl);
+        if (location == null || !location.IsAbsoluteUri || location.Scheme != Uri.UriSchemeHttps ||
+            current.Scheme != Uri.UriSchemeHttp ||
+            !string.Equals(location.Host, current.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var builder = new UriBuilder(current) { Scheme = Uri.UriSchemeHttps, Port = location.Port };
+        secureBaseUrl = builder.Uri.AbsoluteUri.TrimEnd('/');
+        return true;
     }
 
     private static async Task<T?> TryRead<T>(HttpResponseMessage response, CancellationToken cancellationToken)

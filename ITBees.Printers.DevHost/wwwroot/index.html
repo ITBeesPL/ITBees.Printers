@@ -90,7 +90,9 @@ function renderConnectPage() {
   document.getElementById('confirm').onclick = async (event) => {
     event.target.disabled = true;
     try {
-      const registration = await api('POST', '/PrintAgentRegistration', { machineName: machine });
+      // apiUrl: the address this page reaches the API at - the one address known to work from
+      // the user's computer, so the server can send the agent there (here the API is same-origin).
+      const registration = await api('POST', '/PrintAgentRegistration', { machineName: machine, apiUrl: location.origin });
       callback({ code: registration.code, hub: registration.hubUrl, service: registration.serviceName });
     } catch (e) {
       document.getElementById('error').textContent = e.message;

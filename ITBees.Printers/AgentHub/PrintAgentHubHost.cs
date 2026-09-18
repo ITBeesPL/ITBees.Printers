@@ -3,7 +3,9 @@ using ITBees.Printers.Protocol;
 using ITBees.Printers.Services.Agents;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -12,15 +14,19 @@ using Microsoft.Extensions.Logging;
 namespace ITBees.Printers.AgentHub;
 
 /// <summary>
-/// Opens the dedicated agent port. Registering the library is all a host has to do: this
-/// hosted service starts a second, minimal Kestrel instance on
-/// <see cref="PrintersSettings.AgentPort"/> that serves nothing but the agent registration
-/// endpoint and the <see cref="PrintAgentHub"/>.
+/// Runs the agent endpoints: the registration endpoint and the <see cref="PrintAgentHub"/>.
+/// Registering the library is all a host has to do - this hosted service builds a second,
+/// minimal web host with a container of its own and
+///  - opens the dedicated agent port (<see cref="PrintersSettings.AgentPort"/>) on a Kestrel
+///    instance of its own, and
+///  - hands the same pipeline to the host application, which serves it on its own port as well
+///    (<see cref="PrintersSettings.ExposeOnApplicationPort"/>, see
+///    <see cref="PrintAgentApplicationPortStartupFilter"/>).
 ///
-/// A listener of its own - rather than one more endpoint of the host's Kestrel - keeps the
+/// A listener of its own - rather than one more Listen() on the host's Kestrel - keeps the
 /// library from touching the host's server configuration (adding a Listen() call silently
-/// disables a host's ASPNETCORE_URLS / UseUrls binding) and keeps the agents away from the
-/// application's own middleware, CORS and authentication.
+/// disables a host's ASPNETCORE_URLS / UseUrls binding), and the separate container keeps the
+/// agents away from the application's own middleware, CORS and authentication either way.
 /// </summary>
 public class PrintAgentHubHost : IHostedService
 {
@@ -28,6 +34,7 @@ public class PrintAgentHubHost : IHostedService
 
     private readonly IServiceProvider _applicationServices;
     private readonly PrintAgentGateway _gateway;
+    private readonly PrintAgentApplicationPortBridge _applicationPortBridge;
     private readonly PrintersSettings _settings;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<PrintAgentHubHost> _logger;
@@ -36,11 +43,13 @@ public class PrintAgentHubHost : IHostedService
     public PrintAgentHubHost(
         IServiceProvider applicationServices,
         PrintAgentGateway gateway,
+        PrintAgentApplicationPortBridge applicationPortBridge,
         PrintersSettings settings,
         ILoggerFactory loggerFactory)
     {
         _applicationServices = applicationServices;
         _gateway = gateway;
+        _applicationPortBridge = applicationPortBridge;
         _settings = settings;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<PrintAgentHubHost>();
@@ -48,33 +57,45 @@ public class PrintAgentHubHost : IHostedService
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        if (_settings.AgentPort <= 0)
+        var dedicatedPort = _settings.AgentPort > 0;
+        if (!dedicatedPort && !_settings.ExposeOnApplicationPort)
         {
-            _logger.LogInformation("Print agent listener is disabled (AgentPort = {Port})", _settings.AgentPort);
+            _logger.LogInformation("Print agent endpoints are disabled (no AgentPort, ExposeOnApplicationPort off)");
             return;
         }
 
-        try
+        if (!string.IsNullOrWhiteSpace(_settings.PublicAgentUrl) &&
+            !PrintAgentRegistrationService.TryNormalizeUrl(_settings.PublicAgentUrl, out _))
         {
-            _listener = BuildListener();
-            await _listener.StartAsync(cancellationToken);
-            _gateway.Attach(_listener.Services.GetRequiredService<IHubContext<PrintAgentHub>>());
-            _logger.LogInformation("Print agent listener of \"{ServiceName}\" started on port {Port} (hub: {HubPath})",
-                _settings.ServiceName, _settings.AgentPort, PrintAgentProtocol.HubPath);
+            _logger.LogWarning(
+                "PublicAgentUrl \"{PublicAgentUrl}\" is not a valid http(s) address and is ignored - the agents' address will be worked out per pairing",
+                _settings.PublicAgentUrl);
         }
-        catch (Exception e)
+
+        if (dedicatedPort && !await TryStart(listenOnAgentPort: true, cancellationToken))
         {
-            // A busy port must not take the whole application down - it only loses instant
-            // printing, and the frontend falls back to PDF files.
-            _logger.LogError(e, "Print agent listener could not start on port {Port}: {Message}",
-                _settings.AgentPort, e.Message);
-            _listener?.Dispose();
-            _listener = null;
+            // A busy port must not take the application down - nor instant printing, as long
+            // as the agents can still come in through the application's own port.
+            dedicatedPort = false;
+        }
+
+        if (!dedicatedPort && _settings.ExposeOnApplicationPort)
+        {
+            await TryStart(listenOnAgentPort: false, cancellationToken);
+        }
+
+        if (_listener != null)
+        {
+            _logger.LogInformation(
+                "Print agent endpoints of \"{ServiceName}\" are up: dedicated port {DedicatedPort}, on the application's port: {OnApplicationPort} (hub: {HubPath})",
+                _settings.ServiceName, dedicatedPort ? _settings.AgentPort.ToString() : "off",
+                _settings.ExposeOnApplicationPort ? "yes" : "no", PrintAgentProtocol.HubPath);
         }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        _applicationPortBridge.Detach();
         _gateway.Detach();
         if (_listener == null)
         {
@@ -96,7 +117,28 @@ public class PrintAgentHubHost : IHostedService
         }
     }
 
-    private IHost BuildListener()
+    private async Task<bool> TryStart(bool listenOnAgentPort, CancellationToken cancellationToken)
+    {
+        IHost? listener = null;
+        try
+        {
+            listener = BuildListener(listenOnAgentPort);
+            await listener.StartAsync(cancellationToken);
+            _gateway.Attach(listener.Services.GetRequiredService<IHubContext<PrintAgentHub>>());
+            _listener = listener;
+            return true;
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Print agent endpoints could not start{Where}: {Message}",
+                listenOnAgentPort ? $" on port {_settings.AgentPort}" : string.Empty, e.Message);
+            _applicationPortBridge.Detach();
+            listener?.Dispose();
+            return false;
+        }
+    }
+
+    private IHost BuildListener(bool listenOnAgentPort)
     {
         // A bare HostBuilder on purpose: no appsettings, no environment variables, no command
         // line - nothing of the host's configuration (URLs, Kestrel section) may leak in here.
@@ -109,9 +151,19 @@ public class PrintAgentHubHost : IHostedService
             })
             .ConfigureWebHost(webHost =>
             {
-                webHost.UseKestrel(kestrel => kestrel.ListenAnyIP(_settings.AgentPort));
+                if (listenOnAgentPort)
+                {
+                    webHost.UseKestrel(kestrel => kestrel.ListenAnyIP(_settings.AgentPort));
+                }
+
                 webHost.ConfigureServices(services =>
                 {
+                    if (!listenOnAgentPort)
+                    {
+                        // Requests only arrive through the application's port - nothing to listen on.
+                        services.AddSingleton<IServer, NoListenerServer>();
+                    }
+
                     services.AddSingleton(new HostApplicationServices(_applicationServices));
                     services.AddSingleton(_gateway);
                     services.AddSingleton(_settings);
@@ -126,15 +178,27 @@ public class PrintAgentHubHost : IHostedService
                 });
                 webHost.Configure(app =>
                 {
+                    // Built once as a delegate of its own, so that the application's port can
+                    // run the very same pipeline (same hub, same live connections).
+                    var pipeline = app.New();
+
                     // The hub is for authenticated agents only; registration and info are anonymous.
-                    app.UseMiddleware<PrintAgentTokenMiddleware>();
-                    app.UseRouting();
-                    app.UseEndpoints(endpoints =>
+                    pipeline.UseMiddleware<PrintAgentTokenMiddleware>();
+                    pipeline.UseRouting();
+                    pipeline.UseEndpoints(endpoints =>
                     {
                         endpoints.MapHub<PrintAgentHub>(PrintAgentProtocol.HubPath);
                         endpoints.MapGet(PrintAgentProtocol.InfoPath, HandleInfo);
                         endpoints.MapPost(PrintAgentProtocol.RegisterPath, HandleRegister);
                     });
+
+                    var requestDelegate = pipeline.Build();
+                    if (_settings.ExposeOnApplicationPort)
+                    {
+                        _applicationPortBridge.Attach(requestDelegate, app.ApplicationServices);
+                    }
+
+                    app.Run(requestDelegate);
                 });
             }, options => options.SuppressEnvironmentConfiguration = true)
             .Build();
@@ -197,5 +261,20 @@ public class PrintAgentHubHost : IHostedService
     {
         public Task WaitForStartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    /// <summary>A web host needs a server; this one never accepts anything by itself.</summary>
+    private sealed class NoListenerServer : IServer
+    {
+        public IFeatureCollection Features { get; } = new FeatureCollection();
+
+        public Task StartAsync<TContext>(IHttpApplication<TContext> application, CancellationToken cancellationToken)
+            where TContext : notnull => Task.CompletedTask;
+
+        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public void Dispose()
+        {
+        }
     }
 }

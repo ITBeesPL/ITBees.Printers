@@ -22,7 +22,7 @@ public class AgentRuntime
 {
     private readonly object _sync = new();
     private readonly List<ServiceConnection> _connections = new();
-    private readonly HashSet<string> _loginsInProgress = new();
+    private readonly Dictionary<string, PendingLogin> _pendingLogins = new();
     private readonly ProfileStore _profileStore = new();
     private readonly CancellationTokenSource _shutdown = new();
     private readonly PrinterScanner _scanner;
@@ -82,8 +82,17 @@ public class AgentRuntime
     /// Makes sure the agent is connected to the given site: a known, working service is left
     /// alone; anything else goes through the browser login.
     /// </summary>
-    public async Task ConnectSite(string siteUrl, bool forceLogin = false)
+    public async Task ConnectSite(string typedSiteUrl, bool forceLogin = false)
     {
+        // "admin.example.com" is what people type - the scheme is on us.
+        if (!AddressNormalizer.TryNormalize(typedSiteUrl, out var siteUrl))
+        {
+            Log.Error($"Login to {typedSiteUrl} failed: not a valid address");
+            Notice?.Invoke(NoticeKind.Error, "Nieprawidłowy adres serwisu",
+                $"„{typedSiteUrl}” nie jest poprawnym adresem. Podaj adres panelu WWW, np. admin.example.com.");
+            return;
+        }
+
         var key = ProfileStore.NormalizeSiteUrl(siteUrl);
         var existing = FindConnection(key);
         if (existing != null && existing.State != ServiceConnectionState.LoginRequired && !forceLogin)
@@ -92,19 +101,25 @@ public class AgentRuntime
             return;
         }
 
+        // Asking again for a site whose login is still open (the tab was closed, the wrong
+        // account was used...) starts over instead of making the user wait out the old attempt.
+        var pending = new PendingLogin(siteUrl, CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token));
         lock (_sync)
         {
-            if (!_loginsInProgress.Add(key))
+            if (_pendingLogins.Remove(key, out var previous))
             {
-                return; // The browser is already open for this site.
+                previous.Cancellation.Cancel();
             }
+
+            _pendingLogins[key] = pending;
         }
 
+        Changed?.Invoke();
         try
         {
-            var login = await _loginFlow.Run(siteUrl, _shutdown.Token);
+            var login = await _loginFlow.Run(siteUrl, pending.Cancellation.Token);
 
-            var profile = existing?.Profile ?? new ServiceProfile { SiteUrl = siteUrl.Trim() };
+            var profile = existing?.Profile ?? new ServiceProfile { SiteUrl = siteUrl };
             profile.HubUrl = login.HubUrl;
             profile.ServiceName = login.ServiceName;
             profile.AgentGuid = login.AgentGuid;
@@ -128,7 +143,8 @@ public class AgentRuntime
         }
         catch (OperationCanceledException)
         {
-            // The application is closing.
+            // Replaced by a newer attempt, cancelled by the user, or the application is closing.
+            Log.Info($"Login to {siteUrl} abandoned");
         }
         catch (Exception e)
         {
@@ -139,10 +155,35 @@ public class AgentRuntime
         {
             lock (_sync)
             {
-                _loginsInProgress.Remove(key);
+                // Only this attempt's own entry - a newer one may already have taken the slot.
+                if (_pendingLogins.TryGetValue(key, out var current) && ReferenceEquals(current, pending))
+                {
+                    _pendingLogins.Remove(key);
+                }
             }
 
+            pending.Cancellation.Dispose();
             Changed?.Invoke();
+        }
+    }
+
+    /// <summary>Sites whose browser login is open right now.</summary>
+    public List<string> GetPendingLogins()
+    {
+        lock (_sync)
+        {
+            return _pendingLogins.Values.Select(x => x.SiteUrl).ToList();
+        }
+    }
+
+    public void CancelLogin(string siteUrl)
+    {
+        lock (_sync)
+        {
+            if (_pendingLogins.TryGetValue(ProfileStore.NormalizeSiteUrl(siteUrl), out var pending))
+            {
+                pending.Cancellation.Cancel();
+            }
         }
     }
 
@@ -161,6 +202,8 @@ public class AgentRuntime
         await Task.WhenAll(GetConnections().Select(x => x.Stop()));
         Log.Info("Agent stopped");
     }
+
+    private sealed record PendingLogin(string SiteUrl, CancellationTokenSource Cancellation);
 
     private ServiceConnection? FindConnection(string normalizedSiteUrl)
     {

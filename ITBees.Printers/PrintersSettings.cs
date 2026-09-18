@@ -21,10 +21,22 @@ public class PrintersSettings
     public int AgentPort { get; set; } = DefaultAgentPort;
 
     /// <summary>
-    /// Address of the agent listener as the agents reach it from outside, e.g.
-    /// "https://adminapi.example.com:7443". Set it whenever the listener sits behind a reverse
-    /// proxy / TLS terminator. When empty, the address is derived from the API request that
-    /// starts the pairing: same scheme and host name, <see cref="AgentPort"/>.
+    /// Also serves the agent endpoints ("/print-agent/hub", "/print-agent/register",
+    /// "/print-agent/info") on the host application's own port, in front of its pipeline
+    /// (an IStartupFilter - nothing to add to Program.cs). Agents can then connect through the
+    /// very address the API is already published at: same reverse proxy, same TLS certificate,
+    /// no extra port to open in a firewall. The dedicated <see cref="AgentPort"/> keeps working
+    /// next to it. On by default.
+    /// </summary>
+    public bool ExposeOnApplicationPort { get; set; } = true;
+
+    /// <summary>
+    /// Address the agents are told to connect to, e.g. "https://adminapi.example.com" or - for
+    /// the dedicated port behind a TLS terminator - "https://adminapi.example.com:7443".
+    /// A missing scheme is read as https. When empty, the address is worked out per pairing:
+    /// with <see cref="ExposeOnApplicationPort"/> it is the address the frontend itself reached
+    /// the API at (reported by the connect page, else taken from the request); otherwise the
+    /// request's host with <see cref="AgentPort"/>. Leave it empty unless that guess is wrong.
     /// </summary>
     public string? PublicAgentUrl { get; set; }
 

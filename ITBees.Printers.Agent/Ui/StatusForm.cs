@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ITBees.Printers.Agent.Configuration;
 using ITBees.Printers.Agent.Connection;
 
 namespace ITBees.Printers.Agent.Ui;
@@ -6,6 +7,8 @@ namespace ITBees.Printers.Agent.Ui;
 /// <summary>The agent's only window: connected services, their state and the log.</summary>
 public sealed class StatusForm : Form
 {
+    private const string PendingLoginText = "Czeka na logowanie w przeglądarce...";
+
     private readonly AgentRuntime _runtime;
     private readonly ListView _services = new()
     {
@@ -50,7 +53,17 @@ public sealed class StatusForm : Form
         connect.Click += (_, _) => ConnectNewSite();
         _login.Click += (_, _) => WithSelected(x => _ = _runtime.ConnectSite(x.Profile.SiteUrl, forceLogin: true));
         _open.Click += (_, _) => WithSelected(x => OpenInBrowser(x.Profile.SiteUrl));
-        _remove.Click += (_, _) => WithSelected(RemoveService);
+        _remove.Click += (_, _) =>
+        {
+            // On a "login in progress" row the button cancels that login instead.
+            if (_services.SelectedItems.Count > 0 && _services.SelectedItems[0].Tag is string pendingSite)
+            {
+                _runtime.CancelLogin(pendingSite);
+                return;
+            }
+
+            WithSelected(RemoveService);
+        };
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42, Padding = new Padding(0, 6, 0, 0) };
         buttons.Controls.AddRange(new Control[] { connect, _login, _open, _remove });
@@ -151,16 +164,40 @@ public sealed class StatusForm : Form
             _services.Items.Add(item);
         }
 
+        // A login waiting for the user in the browser - shown, so that it is clear why "nothing
+        // happens", and cancellable. The row's tag is the site address, not a connection.
+        var connectedSites = _runtime.GetConnections()
+            .Select(x => ProfileStore.NormalizeSiteUrl(x.Profile.SiteUrl))
+            .ToHashSet();
+        foreach (var siteUrl in _runtime.GetPendingLogins())
+        {
+            if (connectedSites.Contains(ProfileStore.NormalizeSiteUrl(siteUrl)))
+            {
+                var row = _services.Items.Cast<ListViewItem>().First(x =>
+                    x.Tag is ServiceConnection connection &&
+                    ProfileStore.NormalizeSiteUrl(connection.Profile.SiteUrl) == ProfileStore.NormalizeSiteUrl(siteUrl));
+                row.SubItems[2].Text = PendingLoginText;
+                continue;
+            }
+
+            _services.Items.Add(new ListViewItem(new[] { "(nowy serwis)", siteUrl, PendingLoginText, "-" })
+            {
+                Tag = siteUrl,
+                Selected = Equals(siteUrl, selected)
+            });
+        }
+
         _services.EndUpdate();
         UpdateButtons();
     }
 
     private void UpdateButtons()
     {
-        var any = _services.SelectedItems.Count > 0;
-        _login.Enabled = any;
-        _open.Enabled = any;
-        _remove.Enabled = any;
+        var tag = _services.SelectedItems.Count > 0 ? _services.SelectedItems[0].Tag : null;
+        _login.Enabled = tag is ServiceConnection;
+        _open.Enabled = tag is ServiceConnection;
+        _remove.Enabled = tag != null;
+        _remove.Text = tag is string ? "Anuluj logowanie" : "Usuń";
     }
 
     private void WithSelected(Action<ServiceConnection> action)
