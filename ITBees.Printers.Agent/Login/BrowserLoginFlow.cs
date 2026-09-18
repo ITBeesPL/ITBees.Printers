@@ -239,7 +239,7 @@ public class BrowserLoginFlow
         {
             Code = code,
             MachineName = AgentInfo.MachineName,
-            AgentVersion = AgentInfo.Version,
+            AgentVersion = AgentInfo.DisplayVersion,
             OsVersion = AgentInfo.OsVersion
         };
 
@@ -401,7 +401,7 @@ public class BrowserLoginFlow
             box-shadow:0 8px 30px #0001;text-align:center}h1{font-size:22px;margin:0 0 10px;color:{{color}}}
             p{margin:0}small{display:block;margin-top:18px;color:#6b7280}</style></head>
             <body><main><h1>{{WebUtility.HtmlEncode(title)}}</h1><p>{{WebUtility.HtmlEncode(message)}}</p>
-            <small>{{AgentInfo.ProductName}} {{AgentInfo.Version}}</small></main></body></html>
+            <small>{{AgentInfo.ProductName}} {{AgentInfo.DisplayVersion}}</small></main></body></html>
             """;
     }
 

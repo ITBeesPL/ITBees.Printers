@@ -70,11 +70,50 @@ Ten sam potok (ten sam hub, ten sam rejestr połączeń) jest dostępny dwiema d
    otwarcia w firewallu (także po stronie sieci klienta, która często blokuje nietypowe porty
    wychodzące). To jest droga zalecana dla produkcji.
 
-W obu przypadkach agenci omijają middleware/CORS/JWT aplikacji. Gdy proxy odrzuca upgrade
-WebSocket dla tej ścieżki, klient SignalR sam schodzi na SSE / long polling. Gdy proxy go
-**połyka** (żądanie wisi bez odpowiedzi - SignalR wtedy nie przechodzi dalej), agent po 20 s
-przerywa próbę i łączy się z tym serwisem już bez WebSocket (w dzienniku: „retrying without
-WebSockets", potem „connected … (without WebSockets)").
+W obu przypadkach agenci omijają middleware/CORS/JWT aplikacji.
+
+### Reverse proxy (nginx) i transporty
+
+Agent próbuje transportów po kolei - WebSocket, server-sent events (SSE), long polling - po
+jednym na próbę, i zostaje przy pierwszym, który zadziała (do zamknięcia aplikacji; po starcie
+znowu od WebSocketu). Sam SignalR schodzi niżej tylko wtedy, gdy transport w ogóle nie
+wystartuje, a proxy psują je na różne sposoby:
+
+- nginx bez ustawień WebSocket odpowiada na upgrade zwykłym `200` („The server returned status
+  code '200' when status code '101' was expected");
+- jego buforowanie odpowiedzi (domyślnie włączone) wstrzymuje strumień SSE - razem z nagłówkami -
+  do końca odpowiedzi, a serwer po 15 s zrywa połączenie, bo nie dostał handshake'u („Handshake
+  was canceled" / „The server disconnected before the handshake could be started"). Transport
+  formalnie wystartował, więc SignalR już nie schodzi do long pollingu - robi to agent;
+- proxy, które upgrade **połyka** (bez żadnej odpowiedzi), kończy próbę po 20 s.
+
+Każde zejście jest w dzienniku („no connection over WebSocket to … - trying server-sent events"),
+a stan „Połączono (long polling)" / „Połączono (server-sent events)" w oknie agenta znaczy: działa,
+ale proxy nie przepuszcza WebSocketów. Po stronie serwera biblioteka dokłada do odpowiedzi huba
+`X-Accel-Buffering: no` (nginx nie buforuje wtedy SSE) i trzyma bezczynny long poll 50 s (domyślne
+90 s SignalR przekracza domyślny `proxy_read_timeout` nginx 60 s, co dawałoby 504). Właściwa
+poprawka to przepuszczenie WebSocketów przez proxy, np. w nginx:
+
+```nginx
+# w http { } - raz
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# w server { } API, obok location /
+location /print-agent/hub {
+    proxy_pass         http://…;   # to samo co w location /
+    proxy_http_version 1.1;
+    proxy_set_header   Upgrade $http_upgrade;
+    proxy_set_header   Connection $connection_upgrade;
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_buffering    off;
+    proxy_read_timeout 120s;
+}
+```
 
 ### Jaki adres dostaje agent
 
@@ -152,8 +191,15 @@ jest przycinana po `PrintJobRetentionDays` (domyślnie 30).
 ## Agent Windows
 
 - Ikona w zasobniku (zielona/żółta/czerwona), okno statusu z listą serwisów i dziennikiem,
-  „Uruchamiaj przy starcie Windows" (klucz Run HKCU), jedna instancja na użytkownika (kolejne
-  uruchomienie z `--site` przekazuje adres do działającej).
+  „Uruchamiaj przy starcie Windows" (klucz Run HKCU), jedna instancja na użytkownika. Ponowne
+  uruchomienie **tego samego** exe przekazuje adres (`--site`) działającej kopii. Kopia uruchomiona
+  **z innego miejsca** (nowszy build, aktualizacja, inny folder) zastępuje działającą - wygrywa
+  uruchomiona jako ostatnia: nowe wersje zamykają się same (`--quit`), starsze (bez `--quit`) są
+  kończone po 6 s; wpis autostartu wskazujący zastąpioną kopię jest przepinany na nową. Bez tego
+  nowy build oddawałby polecenie staremu, który dalej działał po staremu.
+- Wersja z datą builda (`1.0.0 (build 2026-09-18 17:58)`, metadane `BuildTimestamp` z csproj):
+  w tytule okna, w menu ikony, w dzienniku i w panelu serwisu („wersja …" przy komputerze) -
+  widać, który build naprawdę działa.
 - Drukarki: WMI `Win32_Printer` (nazwa, domyślna, sterownik, port, offline, status), raport przy
   połączeniu, na żądanie i co 60 s gdy coś się zmieni.
 - Wydruk: `Windows.Data.Pdf` renderuje strony w rozdzielczości drukarki →
@@ -162,8 +208,9 @@ jest przycinana po `PrintJobRetentionDays` (domyślnie 30).
   zmniejszana do obszaru zadruku; orientacja dobierana do papieru. Kopie przez sterownik, a gdy
   ich nie obsługuje - przez powtórzenie stron.
 - Połączenie: własna pętla reconnect z back-offem (2 s → 30 s) bez końca; każda próba to nowe
-  połączenie z limitem 20 s (potem - raz - próba bez WebSocket, patrz wyżej); 401 = token
-  unieważniony → stan „wymaga zalogowania".
+  połączenie z limitem 20 s na jednym transporcie (kolejność transportów i kiedy agent przechodzi
+  do następnego - patrz „Reverse proxy (nginx) i transporty"); 401 = token unieważniony → stan
+  „wymaga zalogowania".
 - Dziennik: `%LocalAppData%\ITBees\PrintAgent\logs\agent-yyyyMMdd.log` (14 dni). Bez treści
   dokumentów, tokenów i kodów.
 
@@ -171,7 +218,11 @@ Zmienne środowiskowe do diagnostyki / testów: `ITBEES_PRINT_AGENT_DATA_DIR` (o
 profili), `ITBEES_PRINT_AGENT_NO_BROWSER=1` (adres logowania do dziennika zamiast przeglądarki),
 `ITBEES_PRINT_AGENT_PRINT_TO_DIR` (drukarki „do pliku", np. Microsoft Print to PDF, zapisują tam
 zamiast pytać o nazwę pliku), `ITBEES_PRINT_AGENT_DRY_RUN=1` (dokument jest parsowany i
-renderowany, ale nie trafia do spoolera - z `PRINT_TO_DIR` strony zapisują się jako PNG). Tryb
+renderowany, ale nie trafia do spoolera - z `PRINT_TO_DIR` strony zapisują się jako PNG),
+`ITBEES_PRINT_AGENT_TRACE=1` (dziennik klienta SignalR - negocjacja, transporty, handshake - do
+pliku dziennika jako linie `[TRC]`, bez tokenów i treści dokumentów; tak widać, co robi proxy po
+drodze), `ITBEES_PRINT_AGENT_TRANSPORTS` (np. `LongPolling` albo `ServerSentEvents,LongPolling` -
+tylko te transporty, bez schodzenia po kolei). Tryb
 „na sucho" jest wart używania w testach: każdy prawdziwy wydruk Windows (przy włączonym
 „Zezwalaj systemowi Windows na zarządzanie drukarką domyślną") robi z użytej drukarki drukarkę
 domyślną.

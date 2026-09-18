@@ -23,7 +23,7 @@ public sealed class AgentApplicationContext : ApplicationContext
         _autoStartItem.Click += (_, _) => AutoStart.Set(_autoStartItem.Checked);
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add(new ToolStripMenuItem($"{AgentInfo.ProductName} {AgentInfo.Version}") { Enabled = false });
+        menu.Items.Add(new ToolStripMenuItem($"{AgentInfo.ProductName} {AgentInfo.DisplayVersion}") { Enabled = false });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Pokaż okno", null, (_, _) => ShowStatusForm());
         menu.Items.Add("Połącz z serwisem...", null, (_, _) => ConnectNewSite());
@@ -48,11 +48,20 @@ public sealed class AgentApplicationContext : ApplicationContext
         _runtime.Start();
         _singleInstance.StartListening();
         UpdateTrayIcon();
+        AnnounceReplacedCopy();
         HandleArguments(arguments, showWindow: !arguments.Minimized);
     }
 
     private void HandleArguments(AgentArguments arguments, bool showWindow)
     {
+        if (arguments.Quit)
+        {
+            // Another copy of the agent (another folder - usually a newer build) takes over.
+            _runtime.Log.Info("Another copy of the agent is taking over - closing");
+            _ = Exit();
+            return;
+        }
+
         if (!string.IsNullOrWhiteSpace(arguments.SiteUrl))
         {
             _ = _runtime.ConnectSite(arguments.SiteUrl);
@@ -63,6 +72,25 @@ public sealed class AgentApplicationContext : ApplicationContext
         {
             ShowStatusForm();
         }
+    }
+
+    private void AnnounceReplacedCopy()
+    {
+        if (_singleInstance.ReplacedExecutable is not { } replaced)
+        {
+            return;
+        }
+
+        _runtime.Log.Info($"Replaced the copy of the agent that was running from {replaced}");
+        if (AutoStart.RefersTo(replaced))
+        {
+            // "Start with Windows" would bring the replaced copy back on the next login.
+            AutoStart.Set(true);
+            _runtime.Log.Info("Start with Windows now starts this copy");
+        }
+
+        ShowBalloon(NoticeKind.Info, AgentInfo.ProductName,
+            $"Zastąpiono wcześniej uruchomioną kopię aplikacji ({replaced}).");
     }
 
     private void ShowStatusForm()

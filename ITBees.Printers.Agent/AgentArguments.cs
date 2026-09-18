@@ -15,6 +15,9 @@ public class AgentArguments
     /// <summary>Start without showing the status window (used by the autostart entry).</summary>
     public bool Minimized { get; private set; }
 
+    /// <summary>Close down - sent by another copy of the agent taking this one's place (see <see cref="SingleInstance"/>).</summary>
+    public bool Quit { get; private set; }
+
     public static AgentArguments Parse(IReadOnlyList<string> args)
     {
         var result = new AgentArguments();
@@ -35,6 +38,10 @@ public class AgentArguments
             else if (IsOption(arg, "minimized", "m"))
             {
                 result.Minimized = true;
+            }
+            else if (string.Equals(arg, SingleInstance.QuitArgument, StringComparison.OrdinalIgnoreCase))
+            {
+                result.Quit = true;
             }
             else if (result.SiteUrl == null && !arg.StartsWith('-') && !arg.StartsWith('/'))
             {

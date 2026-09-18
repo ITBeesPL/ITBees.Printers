@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using ITBees.Printers.Agent.Configuration;
 using ITBees.Printers.Agent.Connection;
+using Microsoft.AspNetCore.Http.Connections;
 
 namespace ITBees.Printers.Agent.Ui;
 
@@ -36,7 +37,7 @@ public sealed class StatusForm : Form
     {
         _runtime = runtime;
 
-        Text = $"{AgentInfo.ProductName} {AgentInfo.Version} - {AgentInfo.MachineName}";
+        Text = $"{AgentInfo.ProductName} {AgentInfo.DisplayVersion} - {AgentInfo.MachineName}";
         Icon = icon;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -113,7 +114,11 @@ public sealed class StatusForm : Form
     {
         return connection.State switch
         {
-            ServiceConnectionState.Connected => "Połączono",
+            // Anything but a WebSocket means a proxy on the way that does not pass them - it
+            // works, but the service's administrator may want to know.
+            ServiceConnectionState.Connected => connection.Transport == HttpTransportType.WebSockets
+                ? "Połączono"
+                : $"Połączono ({ServiceConnection.Describe(connection.Transport)})",
             ServiceConnectionState.Connecting => "Łączenie...",
             ServiceConnectionState.LoginRequired => "Wymaga zalogowania",
             _ => string.IsNullOrEmpty(connection.LastError) ? "Rozłączono" : "Brak połączenia - ponawiam"

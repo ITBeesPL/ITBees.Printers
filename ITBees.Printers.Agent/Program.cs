@@ -8,10 +8,9 @@ internal static class Program
     private static void Main(string[] args)
     {
         using var singleInstance = new SingleInstance();
-        if (!singleInstance.IsFirstInstance)
+        if (!singleInstance.IsFirstInstance && !singleInstance.HandOverOrReplace(args))
         {
-            // Already running: pass the command line on (e.g. a new --site) and leave.
-            singleInstance.SendToFirstInstance(args);
+            // The same program is already running and took the command line (e.g. a new --site).
             return;
         }
 

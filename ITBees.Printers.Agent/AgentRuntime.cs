@@ -57,7 +57,7 @@ public class AgentRuntime
 
     public void Start()
     {
-        Log.Info($"{AgentInfo.ProductName} {AgentInfo.Version} started on {AgentInfo.MachineName} " +
+        Log.Info($"{AgentInfo.ProductName} {AgentInfo.DisplayVersion} started on {AgentInfo.MachineName} " +
                  $"(protocol {PrintAgentProtocol.Version})");
         _printQueue.Start(_shutdown.Token);
 

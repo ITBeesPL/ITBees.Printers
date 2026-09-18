@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Reflection;
 
 namespace ITBees.Printers.Agent;
@@ -33,9 +34,35 @@ public static class AgentInfo
 
     public static bool DryRun => Environment.GetEnvironmentVariable(DryRunVariable) == "1";
 
+    /// <summary>
+    /// Diagnostics: when set to "1", the SignalR client's own log (negotiation, transports,
+    /// handshake) goes into the log file - enough to see what a proxy on the way does to the
+    /// connection. File only, never the status window; tokens and documents are not in it.
+    /// </summary>
+    public const string TraceVariable = "ITBEES_PRINT_AGENT_TRACE";
+
+    public static bool Trace => Environment.GetEnvironmentVariable(TraceVariable) == "1";
+
+    /// <summary>
+    /// Diagnostics: "WebSockets", "ServerSentEvents" and/or "LongPolling" (comma separated) -
+    /// the only transports the agent may use, instead of trying them one after another.
+    /// </summary>
+    public const string TransportsVariable = "ITBEES_PRINT_AGENT_TRANSPORTS";
+
     public static string Version { get; } =
         (Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()
             ?.InformationalVersion ?? "1.0.0").Split('+')[0];
+
+    /// <summary>When this build was made (the BuildTimestamp metadata of the csproj), in UTC.</summary>
+    public static DateTime? BuildTimeUtc { get; } = ReadBuildTime();
+
+    /// <summary>
+    /// "1.0.0 (build 2026-09-18 17:58)" - the build time tells apart builds of one version number.
+    /// Shown in the window title, the tray menu and the log, and reported to the services (their
+    /// print settings page shows which build a computer runs).
+    /// </summary>
+    public static string DisplayVersion =>
+        BuildTimeUtc is { } built ? $"{Version} (build {built.ToLocalTime():yyyy-MM-dd HH:mm})" : Version;
 
     public static string MachineName => Environment.MachineName;
 
@@ -56,4 +83,13 @@ public static class AgentInfo
 
     public static string? PrintToDirectory =>
         Environment.GetEnvironmentVariable(PrintToDirectoryVariable) is { Length: > 0 } directory ? directory : null;
+
+    private static DateTime? ReadBuildTime()
+    {
+        var value = Assembly.GetExecutingAssembly().GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(x => x.Key == "BuildTimestamp")?.Value;
+        return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var built)
+            ? built.ToUniversalTime()
+            : null;
+    }
 }

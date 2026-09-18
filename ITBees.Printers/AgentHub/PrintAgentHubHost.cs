@@ -182,12 +182,32 @@ public class PrintAgentHubHost : IHostedService
                     // run the very same pipeline (same hub, same live connections).
                     var pipeline = app.New();
 
+                    // nginx buffers proxied responses unless told otherwise, which holds a
+                    // server-sent event stream back until it ends (and the agent's handshake with
+                    // it) - "X-Accel-Buffering: no" turns that off per response; other proxies
+                    // ignore it. WebSockets need the proxy's own configuration (see the README).
+                    pipeline.Use((context, next) =>
+                    {
+                        if (context.Request.Path.StartsWithSegments(PrintAgentProtocol.HubPath))
+                        {
+                            context.Response.Headers["X-Accel-Buffering"] = "no";
+                        }
+
+                        return next(context);
+                    });
+
                     // The hub is for authenticated agents only; registration and info are anonymous.
                     pipeline.UseMiddleware<PrintAgentTokenMiddleware>();
                     pipeline.UseRouting();
                     pipeline.UseEndpoints(endpoints =>
                     {
-                        endpoints.MapHub<PrintAgentHub>(PrintAgentProtocol.HubPath);
+                        endpoints.MapHub<PrintAgentHub>(PrintAgentProtocol.HubPath, hub =>
+                        {
+                            // An idle long poll is held open this long. SignalR's default (90 s)
+                            // outlasts nginx's default proxy_read_timeout (60 s), which would turn
+                            // every quiet poll into a 504 and drop the agent.
+                            hub.LongPolling.PollTimeout = TimeSpan.FromSeconds(50);
+                        });
                         endpoints.MapGet(PrintAgentProtocol.InfoPath, HandleInfo);
                         endpoints.MapPost(PrintAgentProtocol.RegisterPath, HandleRegister);
                     });

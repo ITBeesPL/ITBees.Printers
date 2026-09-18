@@ -1,11 +1,14 @@
 using System.Drawing.Printing;
 using System.Net;
+using System.Net.WebSockets;
 using ITBees.Printers.Agent.Configuration;
 using ITBees.Printers.Agent.Logging;
 using ITBees.Printers.Agent.Printing;
 using ITBees.Printers.Protocol;
 using Microsoft.AspNetCore.Http.Connections;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.AspNetCore.SignalR.Client;
+using Microsoft.Extensions.Logging;
 
 namespace ITBees.Printers.Agent.Connection;
 
@@ -33,13 +36,29 @@ public class ServiceConnection
     // Connecting normally takes well under a second; this only has to beat a request that hangs.
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(20);
 
+    /// <summary>
+    /// The transports, best first - one per connection attempt. SignalR falls back to the next
+    /// transport by itself only when one cannot even start. Reverse proxies break them in other
+    /// ways too: nginx without WebSocket settings answers the upgrade with a plain 200 (that one
+    /// SignalR handles), but its response buffering then holds the event stream back until the
+    /// server gives up waiting for the handshake - the stream "starts", the handshake fails, and
+    /// SignalR never gets to long polling. So the agent walks down this list itself and stays on
+    /// the first transport that works, for as long as it runs.
+    /// </summary>
+    private static readonly HttpTransportType[] Transports =
+    {
+        HttpTransportType.WebSockets,
+        HttpTransportType.ServerSentEvents,
+        HttpTransportType.LongPolling
+    };
+
     private readonly ProfileStore _profileStore;
     private readonly PrinterScanner _scanner;
     private readonly PrintQueue _printQueue;
     private readonly AgentLog _log;
     private readonly CancellationTokenSource _stop = new();
     private HubConnection? _connection;
-    private bool _avoidWebSockets;
+    private int _transport;
     private string? _reportedFingerprint;
 
     public ServiceConnection(ServiceProfile profile, ProfileStore profileStore, PrinterScanner scanner,
@@ -57,6 +76,9 @@ public class ServiceConnection
     public ServiceConnectionState State { get; private set; }
     public string? LastError { get; private set; }
     public int ReportedPrinters { get; private set; }
+
+    /// <summary>The transport of the current (or last) connection.</summary>
+    public HttpTransportType Transport => ForcedTransports ?? Transports[_transport];
 
     /// <summary>Raised on any thread whenever the state shown to the user changes.</summary>
     public event Action<ServiceConnection>? Changed;
@@ -148,16 +170,20 @@ public class ServiceConnection
 
     private HubConnection BuildConnection(string token, TaskCompletionSource<Exception?> closed)
     {
-        var connection = new HubConnectionBuilder()
+        var builder = new HubConnectionBuilder()
             .WithUrl(Profile.HubUrl.TrimEnd('/') + PrintAgentProtocol.HubPath, options =>
             {
                 options.AccessTokenProvider = () => Task.FromResult<string?>(token);
-                if (_avoidWebSockets)
-                {
-                    options.Transports = HttpTransportType.ServerSentEvents | HttpTransportType.LongPolling;
-                }
-            })
-            .Build();
+                options.Transports = Transport;
+            });
+        if (AgentInfo.Trace)
+        {
+            builder.ConfigureLogging(logging => logging
+                .AddProvider(new AgentLogLoggerProvider(_log, Profile.DisplayName))
+                .SetMinimumLevel(LogLevel.Trace));
+        }
+
+        var connection = builder.Build();
 
         connection.On<AgentPrintJob, AgentPrintJobAck>(PrintAgentProtocol.PrintMethod, HandlePrint);
         connection.On(PrintAgentProtocol.RefreshPrintersMethod, () => ReportPrinters(force: true));
@@ -173,6 +199,30 @@ public class ServiceConnection
         };
 
         return connection;
+    }
+
+    /// <summary>The transports set by <see cref="AgentInfo.TransportsVariable"/>, if any.</summary>
+    private static HttpTransportType? ForcedTransports
+    {
+        get
+        {
+            var value = Environment.GetEnvironmentVariable(AgentInfo.TransportsVariable);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            var transports = HttpTransportType.None;
+            foreach (var name in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (Enum.TryParse<HttpTransportType>(name, ignoreCase: true, out var transport))
+                {
+                    transports |= transport;
+                }
+            }
+
+            return transports == HttpTransportType.None ? null : transports;
+        }
     }
 
     private static async Task DisposeQuietly(HubConnection connection)
@@ -198,7 +248,7 @@ public class ServiceConnection
             await connection.StartAsync(startTimeout.Token);
             SetState(ServiceConnectionState.Connected, null);
             _log.Info($"{Profile.DisplayName}: connected to {Profile.HubUrl}" +
-                      (_avoidWebSockets ? " (without WebSockets)" : string.Empty));
+                      (Transport == HttpTransportType.WebSockets ? string.Empty : $" ({Describe(Transport)})"));
             await ReportPrinters(force: true);
             return ConnectOutcome.Connected;
         }
@@ -206,30 +256,39 @@ public class ServiceConnection
         {
             return ConnectOutcome.Stopped;
         }
-        catch (Exception) when (startTimeout.IsCancellationRequested)
-        {
-            // (SignalR reports a cancelled start as "unable to connect with any of the available
-            // transports", not as an OperationCanceledException - hence the filter on the token.)
-            // Nothing came back in time. SignalR falls back to other transports when a WebSocket
-            // is refused - but not when a proxy on the way swallows the upgrade request and never
-            // answers. From now on this service is reached without WebSockets.
-            if (!_avoidWebSockets)
-            {
-                _avoidWebSockets = true;
-                _log.Warning($"{Profile.DisplayName}: no answer from {Profile.HubUrl} within " +
-                             $"{StartTimeout.TotalSeconds:0} s - retrying without WebSockets");
-                return ConnectOutcome.RetryNow;
-            }
-
-            SetState(ServiceConnectionState.Disconnected, "Serwis nie odpowiada.");
-            return ConnectOutcome.RetryLater;
-        }
         catch (Exception e) when (IsUnauthorized(e))
         {
             // 401 is final: the agent was removed from the account, or paired again elsewhere.
             _log.Warning($"{Profile.DisplayName}: the service no longer accepts this agent's token");
             RequireLogin("Serwis nie rozpoznaje już tej aplikacji - zaloguj się ponownie.");
             return ConnectOutcome.Stopped;
+        }
+        catch (Exception e) when (startTimeout.IsCancellationRequested || IsTransportFailure(e))
+        {
+            // The service is there, this transport just does not get through - or nothing came
+            // back in time at all (a proxy that swallows the WebSocket upgrade never answers).
+            // SignalR reports a cancelled start as "unable to connect with any of the available
+            // transports", not as an OperationCanceledException - hence the filter on the token.
+            var reason = startTimeout.IsCancellationRequested
+                ? $"no answer within {StartTimeout.TotalSeconds:0} s"
+                : Reason(e);
+            if (ForcedTransports == null && _transport < Transports.Length - 1)
+            {
+                var failed = Transport;
+                _transport++;
+                _log.Warning($"{Profile.DisplayName}: no connection over {Describe(failed)} to {Profile.HubUrl} " +
+                             $"({reason}) - trying {Describe(Transport)}");
+                return ConnectOutcome.RetryNow;
+            }
+
+            var error = startTimeout.IsCancellationRequested ? "Serwis nie odpowiada." : reason;
+            if (LastError != error)
+            {
+                _log.Warning($"{Profile.DisplayName}: cannot connect to {Profile.HubUrl} ({Describe(Transport)}): {reason}");
+            }
+
+            SetState(ServiceConnectionState.Disconnected, error);
+            return ConnectOutcome.RetryLater;
         }
         catch (Exception e)
         {
@@ -326,7 +385,7 @@ public class ServiceConnection
             await connection.InvokeAsync(PrintAgentProtocol.ReportPrintersMethod, new AgentPrintersReport
             {
                 MachineName = AgentInfo.MachineName,
-                AgentVersion = AgentInfo.Version,
+                AgentVersion = AgentInfo.DisplayVersion,
                 OsVersion = AgentInfo.OsVersion,
                 Printers = printers
             });
@@ -365,8 +424,53 @@ public class ServiceConnection
         Changed?.Invoke(this);
     }
 
+    public static string Describe(HttpTransportType transport)
+    {
+        return transport switch
+        {
+            HttpTransportType.WebSockets => "WebSocket",
+            HttpTransportType.ServerSentEvents => "server-sent events",
+            HttpTransportType.LongPolling => "long polling",
+            _ => transport.ToString()
+        };
+    }
+
     private static bool IsUnauthorized(Exception? error)
     {
-        return error is HttpRequestException { StatusCode: HttpStatusCode.Unauthorized };
+        return error switch
+        {
+            HttpRequestException { StatusCode: HttpStatusCode.Unauthorized } => true,
+
+            // A 401 on the event stream or on a poll comes wrapped per transport.
+            AggregateException aggregate => aggregate.InnerExceptions.Any(x => IsUnauthorized(x.InnerException)),
+            _ => false
+        };
+    }
+
+    /// <summary>
+    /// The service answered, but the transport or the handshake over it failed - unlike a
+    /// service that is down or out of reach (the negotiation fails), which no other transport
+    /// would change.
+    /// </summary>
+    private static bool IsTransportFailure(Exception error)
+    {
+        return error is
+            // "Unable to connect to the server with any of the available transports": negotiated, not started.
+            AggregateException or WebSocketException or
+            // Started, but the handshake failed, broke off or timed out.
+            HubException or IOException or OperationCanceledException or TimeoutException;
+    }
+
+    /// <summary>What actually went wrong, rather than SignalR's wrapper around it.</summary>
+    private static string Reason(Exception error)
+    {
+        // One entry per transport; the transports this attempt did not use carry no inner exception.
+        if (error is AggregateException aggregate &&
+            aggregate.InnerExceptions.FirstOrDefault(x => x.InnerException != null) is { } tried)
+        {
+            return tried.InnerException!.Message;
+        }
+
+        return error.Message;
     }
 }

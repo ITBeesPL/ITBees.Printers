@@ -26,6 +26,9 @@ public class AgentLog
     public void Error(string message, Exception? exception = null) =>
         Write("ERR", exception == null ? message : $"{message} [{exception.GetType().Name}: {exception.Message}]");
 
+    /// <summary>Diagnostics (see <see cref="AgentInfo.TraceVariable"/>): the file only, never the status window.</summary>
+    public void Trace(string message) => Write("TRC", message, fileOnly: true);
+
     public IReadOnlyList<string> Snapshot()
     {
         lock (_sync)
@@ -34,15 +37,20 @@ public class AgentLog
         }
     }
 
-    private void Write(string level, string message)
+    private void Write(string level, string message, bool fileOnly = false)
     {
-        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{level}] {message}";
+        // Diagnostic lines get milliseconds - they are about timing more often than not.
+        var now = DateTime.Now;
+        var line = $"{now.ToString(fileOnly ? "yyyy-MM-dd HH:mm:ss.fff" : "yyyy-MM-dd HH:mm:ss")} [{level}] {message}";
         lock (_sync)
         {
-            _lines.AddLast(line);
-            while (_lines.Count > MaxLinesInMemory)
+            if (!fileOnly)
             {
-                _lines.RemoveFirst();
+                _lines.AddLast(line);
+                while (_lines.Count > MaxLinesInMemory)
+                {
+                    _lines.RemoveFirst();
+                }
             }
 
             try
@@ -56,7 +64,10 @@ public class AgentLog
             }
         }
 
-        LineAdded?.Invoke(line);
+        if (!fileOnly)
+        {
+            LineAdded?.Invoke(line);
+        }
     }
 
     private static void RemoveOldFiles()

@@ -11,14 +11,14 @@ public static class AutoStart
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string ValueName = "ITBees Print Agent";
 
-    public static bool IsEnabled
+    public static bool IsEnabled => RefersTo(Environment.ProcessPath ?? "\0");
+
+    /// <summary>The "start with Windows" entry starts the given executable.</summary>
+    public static bool RefersTo(string executable)
     {
-        get
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(RunKey);
-            return key?.GetValue(ValueName) is string command &&
-                   command.Contains(Environment.ProcessPath ?? "\0", StringComparison.OrdinalIgnoreCase);
-        }
+        using var key = Registry.CurrentUser.OpenSubKey(RunKey);
+        return key?.GetValue(ValueName) is string command &&
+               command.Contains(executable, StringComparison.OrdinalIgnoreCase);
     }
 
     public static void Set(bool enabled)
